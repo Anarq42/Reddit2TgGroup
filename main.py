@@ -7,6 +7,7 @@ import datetime
 import logging
 import asyncio
 from telegram.constants import ParseMode
+from telegram import InputMediaPhoto, InputMediaVideo
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -104,26 +105,33 @@ def escape_markdown_v2_text(text):
         escaped_text = escaped_text.replace(char, f'\\{char}')
     return escaped_text
 
-def get_post_media_url(submission):
-    """Checks for and returns a direct URL for media (image or video) from a Reddit submission."""
+def get_submission_media(submission):
+    """Checks for and returns a list of media objects (urls and types) from a Reddit submission."""
+    media_list = []
     if hasattr(submission, 'is_gallery') and submission.is_gallery:
-        # The submission.gallery_data['items'] is a list of dictionaries.
-        # We need the 'media_id' from each dictionary to access the metadata.
+        # It's a gallery post, so get all media items.
         for item in submission.gallery_data['items']:
             media_id = item['media_id']
-            image_url = submission.media_metadata[media_id]['s']['u']
-            # Sometimes a gallery URL ends in 'preview.jpg', convert it to the full image.
-            return image_url.split('?')[0].replace('preview', 'i')
-    elif hasattr(submission, 'post_hint') and submission.post_hint == 'image':
-        return submission.url
-    elif hasattr(submission, 'is_video') and submission.is_video:
-        # Use the fallback URL for a video from reddit.
-        if hasattr(submission.media, 'reddit_video'):
-            return submission.media['reddit_video']['fallback_url']
+            # Get the media type from the metadata to determine if it's an image or video.
+            media_type = submission.media_metadata[media_id]['e']
+            if media_type == 'Image':
+                url = submission.media_metadata[media_id]['s']['u'].split('?')[0].replace('preview', 'i')
+                media_list.append({'url': url, 'type': 'photo'})
+            elif media_type == 'Video':
+                # Galleries can contain videos, though this is less common.
+                url = submission.media_metadata[media_id]['s']['fallback_url']
+                media_list.append({'url': url, 'type': 'video'})
+    elif hasattr(submission, 'post_hint'):
+        if submission.post_hint == 'image':
+            media_list.append({'url': submission.url, 'type': 'photo'})
+        elif submission.post_hint == 'video' and hasattr(submission.media, 'reddit_video'):
+            media_list.append({'url': submission.media['reddit_video']['fallback_url'], 'type': 'video'})
     elif hasattr(submission, 'preview') and 'images' in submission.preview:
         # A fallback for posts that might have a preview image but aren't a direct link
-        return submission.preview['images'][0]['source']['url']
-    return None
+        url = submission.preview['images'][0]['source']['url']
+        media_list.append({'url': url, 'type': 'photo'})
+        
+    return media_list
 
 def get_top_comments(submission):
     """Fetches the top 3 comments from a submission."""
@@ -159,8 +167,8 @@ async def main():
             for submission in subreddit.new(limit=25):  # Limiting to 25 to stay within rate limits
                 # Check if the post is recent (last 30 minutes) and not already processed
                 if submission.created_utc > (time.time() - CHECK_INTERVAL_SECONDS) and submission.id not in processed_posts:
-                    media_url = get_post_media_url(submission)
-                    if media_url:
+                    media_list = get_submission_media(submission)
+                    if media_list:
                         logging.info(f"Found new media post in r/{subreddit_name}: {submission.title}")
                         
                         # Add to processed set immediately to avoid duplicates in this run.
@@ -183,34 +191,47 @@ async def main():
                         if comments:
                             caption += f"\\*\\*Top Comments:\\*\\*\n{comments}"
                         
-                        # Send the media to Telegram
                         try:
-                            # Use requests to download the file into memory first to handle different media types
-                            response = requests.get(media_url)
-                            response.raise_for_status()
+                            if len(media_list) > 1:
+                                # This is a gallery/album. Send as a media group.
+                                # The caption is attached to the first item in the group.
+                                media_group = []
+                                for i, media_item in enumerate(media_list):
+                                    if media_item['type'] == 'photo':
+                                        if i == 0:
+                                            media_group.append(InputMediaPhoto(media=media_item['url'], caption=caption, parse_mode=ParseMode.MARKDOWN_V2))
+                                        else:
+                                            media_group.append(InputMediaPhoto(media=media_item['url']))
+                                    elif media_item['type'] == 'video':
+                                        if i == 0:
+                                            media_group.append(InputMediaVideo(media=media_item['url'], caption=caption, parse_mode=ParseMode.MARKDOWN_V2))
+                                        else:
+                                            media_group.append(InputMediaVideo(media=media_item['url']))
 
-                            # Send the photo/video to the Telegram topic
-                            # The file is passed as a byte stream to avoid saving it to disk.
-                            if 'image' in response.headers.get('Content-Type', '').lower():
-                                await bot.send_photo(
+                                await bot.send_media_group(
                                     chat_id=TELEGRAM_GROUP_ID,
-                                    photo=response.content,
-                                    caption=caption,
-                                    parse_mode=ParseMode.MARKDOWN_V2,
-                                    message_thread_id=topic_id,
-                                )
-                            elif 'video' in response.headers.get('Content-Type', '').lower():
-                                await bot.send_video(
-                                    chat_id=TELEGRAM_GROUP_ID,
-                                    video=response.content,
-                                    caption=caption,
-                                    parse_mode=ParseMode.MARKDOWN_V2,
-                                    message_thread_id=topic_id,
+                                    media=media_group,
+                                    message_thread_id=topic_id
                                 )
                             else:
-                                logging.warning(f"Unsupported media type for URL: {media_url}")
-                                continue
-
+                                # It's a single photo or video.
+                                media_item = media_list[0]
+                                if media_item['type'] == 'photo':
+                                    await bot.send_photo(
+                                        chat_id=TELEGRAM_GROUP_ID,
+                                        photo=media_item['url'],
+                                        caption=caption,
+                                        parse_mode=ParseMode.MARKDOWN_V2,
+                                        message_thread_id=topic_id,
+                                    )
+                                elif media_item['type'] == 'video':
+                                    await bot.send_video(
+                                        chat_id=TELEGRAM_GROUP_ID,
+                                        video=media_item['url'],
+                                        caption=caption,
+                                        parse_mode=ParseMode.MARKDOWN_V2,
+                                        message_thread_id=topic_id,
+                                    )
                             logging.info(f"Successfully sent post {submission.id} to Telegram.")
                         except Exception as e:
                             logging.error(f"Failed to send post {submission.id} to Telegram: {e}")
