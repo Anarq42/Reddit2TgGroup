@@ -1,0 +1,220 @@
+import praw
+import telegram
+import time
+import requests
+import os
+import datetime
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Configuration Section ---
+# This bot uses environment variables for security.
+# You MUST set these environment variables before running the script:
+# export REDDIT_CLIENT_ID='your_reddit_client_id'
+# export REDDIT_CLIENT_SECRET='your_reddit_client_secret'
+# export REDDIT_USERNAME='your_reddit_username'
+# export REDDIT_PASSWORD='your_reddit_password'
+# export TELEGRAM_BOT_TOKEN='your_telegram_bot_token'
+# export TELEGRAM_GROUP_ID='-100xxxxxxxxxx'
+
+# A note on Telegram Group IDs: They start with "-100" and are followed by a series of numbers.
+# To find your group's ID, add a bot to the group, send a message, and check the getUpdates API endpoint:
+# https://api.telegram.org/bot<YOUR_TELEGRAM_BOT_TOKEN>/getUpdates
+
+# Load credentials from environment variables
+try:
+    REDDIT_CLIENT_ID = os.environ['REDDIT_CLIENT_ID']
+    REDDIT_CLIENT_SECRET = os.environ['REDDIT_CLIENT_SECRET']
+    REDDIT_USERNAME = os.environ['REDDIT_USERNAME']
+    REDDIT_PASSWORD = os.environ['REDDIT_PASSWORD']
+    TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+    TELEGRAM_GROUP_ID = os.environ['TELEGRAM_GROUP_ID']
+except KeyError as e:
+    logging.error(f"Missing environment variable: {e}. Please set all required variables.")
+    exit()
+
+# Set a descriptive user agent for Reddit, as required by their API rules.
+# This helps them identify your bot and contact you if needed.
+REDDIT_USER_AGENT = "script:reddit-to-telegram-bot:v1.0 (by /u/YOUR_REDDIT_USERNAME)"
+
+# Initialize Reddit API client
+try:
+    reddit = praw.Reddit(
+        client_id=REDDIT_CLIENT_ID,
+        client_secret=REDDIT_CLIENT_SECRET,
+        password=REDDIT_PASSWORD,
+        user_agent=REDDIT_USER_AGENT,
+        username=REDDIT_USERNAME,
+    )
+    logging.info("Successfully connected to Reddit.")
+except Exception as e:
+    logging.error(f"Failed to connect to Reddit: {e}")
+    exit()
+
+# Initialize Telegram bot API client
+try:
+    bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+    logging.info("Successfully connected to Telegram.")
+except Exception as e:
+    logging.error(f"Failed to connect to Telegram: {e}")
+    exit()
+
+# Path to the subreddit configuration file
+SUBREDDIT_DB_FILE = 'subreddits.db'
+# Time in seconds to check for new posts (30 minutes)
+CHECK_INTERVAL_SECONDS = 30 * 60
+
+# Keep a set of previously processed posts to avoid duplicates.
+# This simple cache will be cleared upon script restart. For long-term
+# storage, a database like SQLite or a simple file could be used.
+processed_posts = set()
+
+def load_subreddits():
+    """Loads subreddits and their corresponding Telegram topic IDs from the database file."""
+    subreddits = {}
+    if not os.path.exists(SUBREDDIT_DB_FILE):
+        logging.warning(f"Configuration file '{SUBREDDIT_DB_FILE}' not found. Please create it.")
+        return subreddits
+
+    with open(SUBREDDIT_DB_FILE, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            try:
+                subreddit_name, topic_id = line.split(',')
+                subreddits[subreddit_name.strip()] = int(topic_id.strip())
+            except ValueError:
+                logging.error(f"Invalid format in {SUBREDDIT_DB_FILE}: '{line}'. Expected format: subreddit_name,topic_id")
+    logging.info(f"Loaded {len(subreddits)} subreddits from configuration.")
+    return subreddits
+
+def get_post_media_url(submission):
+    """Checks for and returns a direct URL for media (image or video) from a Reddit submission."""
+    if hasattr(submission, 'is_gallery') and submission.is_gallery:
+        # Get the first image from a gallery post
+        for media_id in submission.gallery_data['items']:
+            image_url = submission.media_metadata[media_id]['s']['u']
+            # Sometimes a gallery URL ends in 'preview.jpg', convert it to the full image.
+            return image_url.split('?')[0].replace('preview', 'i')
+    elif hasattr(submission, 'post_hint') and submission.post_hint == 'image':
+        return submission.url
+    elif hasattr(submission, 'is_video') and submission.is_video:
+        # Use the fallback URL for a video from reddit.
+        if hasattr(submission.media, 'reddit_video'):
+            return submission.media['reddit_video']['fallback_url']
+    elif hasattr(submission, 'preview') and 'images' in submission.preview:
+        # A fallback for posts that might have a preview image but aren't a direct link
+        return submission.preview['images'][0]['source']['url']
+    return None
+
+def get_top_comments(submission):
+    """Fetches the top 3 comments from a submission."""
+    comments_text = []
+    try:
+        submission.comments.replace_more(limit=0)  # Flatten the comment tree
+        top_comments = sorted(submission.comments, key=lambda c: c.score, reverse=True)[:3]
+        for comment in top_comments:
+            if not comment.author: continue # Skip deleted comments
+            comments_text.append(f"• **u/{comment.author.name}**: {comment.body.strip()}")
+    except Exception as e:
+        logging.warning(f"Could not retrieve comments for post {submission.id}: {e}")
+    return "\n\n".join(comments_text)
+
+
+def download_file(url, file_path):
+    """Downloads a file from a URL to a local path."""
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        with open(file_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        return True
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error downloading file from {url}: {e}")
+        return False
+
+
+def main():
+    """Main function to run the bot loop."""
+    logging.info("Starting bot.")
+    while True:
+        subreddits = load_subreddits()
+        if not subreddits:
+            logging.error("No subreddits found in configuration. Please add some.")
+            time.sleep(CHECK_INTERVAL_SECONDS)
+            continue
+
+        start_time = time.time()
+        for subreddit_name, topic_id in subreddits.items():
+            logging.info(f"Checking r/{subreddit_name} for new posts...")
+            subreddit = reddit.subreddit(subreddit_name)
+
+            # Iterate through the newest submissions. We'll check the creation time.
+            for submission in subreddit.new(limit=25):  # Limiting to 25 to stay within rate limits
+                # Check if the post is recent (last 30 minutes) and not already processed
+                if submission.created_utc > (time.time() - CHECK_INTERVAL_SECONDS) and submission.id not in processed_posts:
+                    media_url = get_post_media_url(submission)
+                    if media_url:
+                        logging.info(f"Found new media post in r/{subreddit_name}: {submission.title}")
+                        
+                        # Add to processed set immediately to avoid duplicates in this run.
+                        processed_posts.add(submission.id)
+                        
+                        # Prepare the message caption
+                        caption = (
+                            f"**New Post from r/{submission.subreddit.display_name}**\n"
+                            f"**Title**: {submission.title}\n"
+                            f"**Author**: u/{submission.author.name if submission.author else '[deleted]'}\n\n"
+                            f"**Link**: [Click to view post]({submission.url})\n\n"
+                        )
+                        
+                        # Get top comments
+                        comments = get_top_comments(submission)
+                        if comments:
+                            caption += f"**Top Comments:**\n{comments}"
+                        
+                        # Send the media to Telegram
+                        try:
+                            # Use requests to download the file into memory first to handle different media types
+                            response = requests.get(media_url)
+                            response.raise_for_status()
+
+                            # Send the photo/video to the Telegram topic
+                            # The file is passed as a byte stream to avoid saving it to disk.
+                            if 'image' in response.headers.get('Content-Type', '').lower():
+                                bot.send_photo(
+                                    chat_id=TELEGRAM_GROUP_ID,
+                                    photo=response.content,
+                                    caption=caption,
+                                    parse_mode=telegram.ParseMode.MARKDOWN_V2,
+                                    message_thread_id=topic_id,
+                                )
+                            elif 'video' in response.headers.get('Content-Type', '').lower():
+                                bot.send_video(
+                                    chat_id=TELEGRAM_GROUP_ID,
+                                    video=response.content,
+                                    caption=caption,
+                                    parse_mode=telegram.ParseMode.MARKDOWN_V2,
+                                    message_thread_id=topic_id,
+                                )
+                            else:
+                                logging.warning(f"Unsupported media type for URL: {media_url}")
+                                continue
+
+                            logging.info(f"Successfully sent post {submission.id} to Telegram.")
+                        except Exception as e:
+                            logging.error(f"Failed to send post {submission.id} to Telegram: {e}")
+            
+        end_time = time.time()
+        duration = end_time - start_time
+        sleep_duration = max(0, CHECK_INTERVAL_SECONDS - duration)
+        
+        logging.info(f"Loop finished in {duration:.2f} seconds. Sleeping for {sleep_duration:.2f} seconds.")
+        time.sleep(sleep_duration)
+
+if __name__ == "__main__":
+    main()
