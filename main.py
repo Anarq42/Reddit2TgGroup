@@ -94,17 +94,6 @@ def load_subreddits():
     logging.info(f"Loaded {len(subreddits)} subreddits from configuration.")
     return subreddits
 
-def escape_markdown_v2_text(text):
-    """
-    Escapes special MarkdownV2 characters.
-    Note: Link URLs and code blocks should NOT be escaped.
-    """
-    reserved_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-    escaped_text = text
-    for char in reserved_chars:
-        escaped_text = escaped_text.replace(char, f'\\{char}')
-    return escaped_text
-
 def get_submission_media(submission):
     """Checks for and returns a list of media objects (urls and types) from a Reddit submission."""
     media_list = []
@@ -141,9 +130,9 @@ def get_top_comments(submission):
         top_comments = sorted(submission.comments, key=lambda c: c.score, reverse=True)[:3]
         for comment in top_comments:
             if not comment.author: continue # Skip deleted comments
-            author_name = escape_markdown_v2_text(comment.author.name)
-            comment_body = escape_markdown_v2_text(comment.body.strip())
-            comments_text.append(f"\\*\\*u/{author_name}\\*\\*: {comment_body}")
+            author_name = comment.author.name
+            comment_body = comment.body.strip()
+            comments_text.append(f"<b>u/{author_name}</b>: {comment_body}")
     except Exception as e:
         logging.warning(f"Could not retrieve comments for post {submission.id}: {e}")
     return "\n\n".join(comments_text)
@@ -174,22 +163,21 @@ async def main():
                         # Add to processed set immediately to avoid duplicates in this run.
                         processed_posts.add(submission.id)
                         
-                        # Prepare the message caption with escaped characters
-                        escaped_title = escape_markdown_v2_text(submission.title)
+                        # Prepare the message caption with HTML formatting
+                        title = submission.title
                         author_name = submission.author.name if submission.author else '[deleted]'
-                        escaped_author = escape_markdown_v2_text(author_name)
                         
                         caption = (
-                            f"\\*\\*New Post from r/{escape_markdown_v2_text(submission.subreddit.display_name)}\\*\\*\n"
-                            f"\\*\\*Title\\*\\*: {escaped_title}\n"
-                            f"\\*\\*Author\\*\\*: u/{escaped_author}\n\n"
-                            f"\\*\\*Link\\*\\*: [Click to view post]({submission.url})\n\n"
+                            f"<b>New Post from r/{submission.subreddit.display_name}</b>\n"
+                            f"<b>Title</b>: {title}\n"
+                            f"<b>Author</b>: u/{author_name}\n\n"
+                            f"<b>Link</b>: <a href='{submission.url}'>Click to view post</a>\n\n"
                         )
                         
                         # Get top comments
                         comments = get_top_comments(submission)
                         if comments:
-                            caption += f"\\*\\*Top Comments:\\*\\*\n{comments}"
+                            caption += f"<b>Top Comments:</b>\n{comments}"
                         
                         try:
                             if len(media_list) > 1:
@@ -199,12 +187,12 @@ async def main():
                                 for i, media_item in enumerate(media_list):
                                     if media_item['type'] == 'photo':
                                         if i == 0:
-                                            media_group.append(InputMediaPhoto(media=media_item['url'], caption=caption, parse_mode=ParseMode.MARKDOWN_V2))
+                                            media_group.append(InputMediaPhoto(media=media_item['url'], caption=caption, parse_mode=ParseMode.HTML))
                                         else:
                                             media_group.append(InputMediaPhoto(media=media_item['url']))
                                     elif media_item['type'] == 'video':
                                         if i == 0:
-                                            media_group.append(InputMediaVideo(media=media_item['url'], caption=caption, parse_mode=ParseMode.MARKDOWN_V2))
+                                            media_group.append(InputMediaVideo(media=media_item['url'], caption=caption, parse_mode=ParseMode.HTML))
                                         else:
                                             media_group.append(InputMediaVideo(media=media_item['url']))
 
@@ -221,7 +209,7 @@ async def main():
                                         chat_id=TELEGRAM_GROUP_ID,
                                         photo=media_item['url'],
                                         caption=caption,
-                                        parse_mode=ParseMode.MARKDOWN_V2,
+                                        parse_mode=ParseMode.HTML,
                                         message_thread_id=topic_id,
                                     )
                                 elif media_item['type'] == 'video':
@@ -229,7 +217,7 @@ async def main():
                                         chat_id=TELEGRAM_GROUP_ID,
                                         video=media_item['url'],
                                         caption=caption,
-                                        parse_mode=ParseMode.MARKDOWN_V2,
+                                        parse_mode=ParseMode.HTML,
                                         message_thread_id=topic_id,
                                     )
                             logging.info(f"Successfully sent post {submission.id} to Telegram.")
