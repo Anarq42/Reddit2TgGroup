@@ -5,6 +5,8 @@ import requests
 import os
 import datetime
 import logging
+import asyncio
+from telegram.constants import ParseMode
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -91,11 +93,24 @@ def load_subreddits():
     logging.info(f"Loaded {len(subreddits)} subreddits from configuration.")
     return subreddits
 
+def escape_markdown_v2_text(text):
+    """
+    Escapes special MarkdownV2 characters.
+    Note: Link URLs and code blocks should NOT be escaped.
+    """
+    reserved_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    escaped_text = text
+    for char in reserved_chars:
+        escaped_text = escaped_text.replace(char, f'\\{char}')
+    return escaped_text
+
 def get_post_media_url(submission):
     """Checks for and returns a direct URL for media (image or video) from a Reddit submission."""
     if hasattr(submission, 'is_gallery') and submission.is_gallery:
-        # Get the first image from a gallery post
-        for media_id in submission.gallery_data['items']:
+        # The submission.gallery_data['items'] is a list of dictionaries.
+        # We need the 'media_id' from each dictionary to access the metadata.
+        for item in submission.gallery_data['items']:
+            media_id = item['media_id']
             image_url = submission.media_metadata[media_id]['s']['u']
             # Sometimes a gallery URL ends in 'preview.jpg', convert it to the full image.
             return image_url.split('?')[0].replace('preview', 'i')
@@ -118,27 +133,14 @@ def get_top_comments(submission):
         top_comments = sorted(submission.comments, key=lambda c: c.score, reverse=True)[:3]
         for comment in top_comments:
             if not comment.author: continue # Skip deleted comments
-            comments_text.append(f"• **u/{comment.author.name}**: {comment.body.strip()}")
+            author_name = escape_markdown_v2_text(comment.author.name)
+            comment_body = escape_markdown_v2_text(comment.body.strip())
+            comments_text.append(f"\\*\\*u/{author_name}\\*\\*: {comment_body}")
     except Exception as e:
         logging.warning(f"Could not retrieve comments for post {submission.id}: {e}")
     return "\n\n".join(comments_text)
 
-
-def download_file(url, file_path):
-    """Downloads a file from a URL to a local path."""
-    try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        with open(file_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        return True
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error downloading file from {url}: {e}")
-        return False
-
-
-def main():
+async def main():
     """Main function to run the bot loop."""
     logging.info("Starting bot.")
     while True:
@@ -164,18 +166,22 @@ def main():
                         # Add to processed set immediately to avoid duplicates in this run.
                         processed_posts.add(submission.id)
                         
-                        # Prepare the message caption
+                        # Prepare the message caption with escaped characters
+                        escaped_title = escape_markdown_v2_text(submission.title)
+                        author_name = submission.author.name if submission.author else '[deleted]'
+                        escaped_author = escape_markdown_v2_text(author_name)
+                        
                         caption = (
-                            f"**New Post from r/{submission.subreddit.display_name}**\n"
-                            f"**Title**: {submission.title}\n"
-                            f"**Author**: u/{submission.author.name if submission.author else '[deleted]'}\n\n"
-                            f"**Link**: [Click to view post]({submission.url})\n\n"
+                            f"\\*\\*New Post from r/{escape_markdown_v2_text(submission.subreddit.display_name)}\\*\\*\n"
+                            f"\\*\\*Title\\*\\*: {escaped_title}\n"
+                            f"\\*\\*Author\\*\\*: u/{escaped_author}\n\n"
+                            f"\\*\\*Link\\*\\*: [Click to view post]({submission.url})\n\n"
                         )
                         
                         # Get top comments
                         comments = get_top_comments(submission)
                         if comments:
-                            caption += f"**Top Comments:**\n{comments}"
+                            caption += f"\\*\\*Top Comments:\\*\\*\n{comments}"
                         
                         # Send the media to Telegram
                         try:
@@ -186,19 +192,19 @@ def main():
                             # Send the photo/video to the Telegram topic
                             # The file is passed as a byte stream to avoid saving it to disk.
                             if 'image' in response.headers.get('Content-Type', '').lower():
-                                bot.send_photo(
+                                await bot.send_photo(
                                     chat_id=TELEGRAM_GROUP_ID,
                                     photo=response.content,
                                     caption=caption,
-                                    parse_mode=telegram.ParseMode.MARKDOWN_V2,
+                                    parse_mode=ParseMode.MARKDOWN_V2,
                                     message_thread_id=topic_id,
                                 )
                             elif 'video' in response.headers.get('Content-Type', '').lower():
-                                bot.send_video(
+                                await bot.send_video(
                                     chat_id=TELEGRAM_GROUP_ID,
                                     video=response.content,
                                     caption=caption,
-                                    parse_mode=telegram.ParseMode.MARKDOWN_V2,
+                                    parse_mode=ParseMode.MARKDOWN_V2,
                                     message_thread_id=topic_id,
                                 )
                             else:
@@ -217,4 +223,4 @@ def main():
         time.sleep(sleep_duration)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
