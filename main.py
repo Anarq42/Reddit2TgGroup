@@ -1,267 +1,258 @@
 import os
+import sys
 import time
 import logging
-import asyncio
-import re
-import io
 import requests
-from datetime import datetime, timedelta
-import praw
-from telegram import Bot, InputMediaPhoto, InputMediaVideo, constants
 from dotenv import load_dotenv
+import telegram
+import praw
+from telegram import InputMediaPhoto, InputMediaVideo
+from telegram.constants import ParseMode
 
-# Load environment variables from .env file
-load_dotenv()
-
-# --- Configuration ---
-# Set up logging for better visibility
+# Configure logging to provide detailed output for debugging.
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-
-# Load credentials from environment variables
-REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
-REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
-REDDIT_USERNAME = os.getenv("REDDIT_USERNAME")
-REDDIT_PASSWORD = os.getenv("REDDIT_PASSWORD")
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_GROUP_ID = os.getenv("TELEGRAM_GROUP_ID")
-
-# Global list to prevent sending the same post multiple times
-sent_posts = []
-CHECK_INTERVAL_SECONDS = 1800  # 30 minutes
-
-# --- PRAW & Telegram Bot Initialization ---
-reddit = praw.Reddit(
-    client_id=REDDIT_CLIENT_ID,
-    client_secret=REDDIT_CLIENT_SECRET,
-    user_agent="script:Reddit to Telegram Bot by u/YOUR_REDDIT_USERNAME",
-    username=REDDIT_USERNAME,
-    password=REDDIT_PASSWORD
-)
-
-# Initialize the Telegram bot
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+logger = logging.getLogger(__name__)
 
 # --- Helper Functions ---
 
-def escape_markdown_v2_text(text):
-    reserved_chars = r'_*[]()~`>#+-=|{}.!'
-    escaped_text = re.sub(f'([{re.escape(reserved_chars)}])', r'\\\1', text)
-    return escaped_text
+def escape_html_text(text):
+    """Escapes HTML special characters in a string."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
-def get_post_media_url(submission):
-    if submission.is_self:
-        return None
-    
-    if submission.is_video:
-        if hasattr(submission.media, 'get') and submission.media.get('reddit_video'):
-            return submission.media['reddit_video']['fallback_url'].split('?')[0]
-
-    if hasattr(submission, 'url'):
-        if submission.url.endswith(('.jpg', '.jpeg', '.png', '.gif', '.gifv', '.mp4')):
-            return submission.url.split('?')[0]
-        
-    return None
-
-def get_post_comments(submission):
+def get_top_comments(submission, num_comments=3):
+    """
+    Fetches the top comments for a given submission.
+    Returns a formatted string of the comments.
+    """
     comments_str = ""
     try:
         submission.comments.replace_more(limit=0)
-        comments = submission.comments.list()
-        if comments:
-            for i in range(min(3, len(comments))):
-                comment = comments[i]
-                if comment and hasattr(comment, 'author') and comment.author:
-                    author_text = f"u/{comment.author.name}"
-                    body_text = comment.body.strip()
-                    escaped_author = escape_markdown_v2_text(author_text)
-                    escaped_body = escape_markdown_v2_text(body_text)
-                    comments_str += f"**{escaped_author}**: {escaped_body}\n"
+        top_comments = list(submission.comments.list)[:num_comments]
+        if top_comments:
+            for comment in top_comments:
+                author = escape_html_text(str(comment.author))
+                body = escape_html_text(comment.body)
+                comments_str += f"<b>{author}</b>: {body}\n\n"
     except Exception as e:
-        logging.error(f"Failed to retrieve comments for post {submission.id}: {e}")
+        logger.error(f"Error fetching comments for post {submission.id}: {e}")
     return comments_str
 
-def get_post_caption(submission, comments_str):
-    title = submission.title
-    author = submission.author.name if submission.author else "Unknown"
-    post_link = f"https://www.reddit.com{submission.permalink}"
-    
-    escaped_title = escape_markdown_v2_text(title)
-    escaped_author = escape_markdown_v2_text(f"u/{author}")
-    escaped_link = escape_markdown_v2_text(post_link)
-    
-    caption_parts = [
-        f"**New Post from r/{submission.subreddit.display_name}**",
-        f"**Title**: {escaped_title}",
-        f"**Author**: {escaped_author}",
-        f"**Link**: [Click to view post]({escaped_link})",
-    ]
-    if comments_str:
-        caption_parts.append("\n**Top Comments:**")
-        caption_parts.append(comments_str)
-        
-    caption = "\n".join(caption_parts)
-    return caption
+def get_media_urls(submission):
+    """
+    Extracts media URLs from a submission, handling different post types.
+    Returns a list of tuples: (media_url, media_type).
+    """
+    media_list = []
+    is_gallery = hasattr(submission, 'media_metadata') and 'gallery_data' in submission.__dict__
 
-async def send_media(media_url, telegram_method, chat_id, caption, topic_id):
-    try:
-        response = requests.get(media_url, stream=True)
-        response.raise_for_status()
-        media_stream = io.BytesIO(response.content)
-        await telegram_method(
-            chat_id=chat_id,
-            media=media_stream,
-            caption=caption,
-            parse_mode=constants.ParseMode.MARKDOWN_V2,
-            message_thread_id=topic_id
-        )
-        return True
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to download media from {media_url}: {e}")
-        return False
-    except Exception as e:
-        logging.error(f"Failed to send media via {telegram_method.__name__}: {e}")
-        return False
-
-async def get_gallery_media(submission, caption):
-    media_group = []
-    if not hasattr(submission, 'gallery_data'):
-        return media_group
-
-    for item in submission.gallery_data['items']:
-        media_id = item['media_id']
-        if media_id in submission.media_metadata:
+    if is_gallery:
+        for item in submission.gallery_data['items']:
+            media_id = item['media_id']
             meta = submission.media_metadata[media_id]
-            file_type = meta['m']
-            
-            if 'p' in meta and 'u' in meta['p'][-1]:
-                url = meta['p'][-1]['u'].split('?')[0]
-                try:
-                    response = requests.get(url, stream=True)
-                    response.raise_for_status()
-                    media_stream = io.BytesIO(response.content)
-                    
-                    if file_type.startswith('image'):
-                        media_group.append(InputMediaPhoto(media=media_stream))
-                    elif file_type.startswith('video'):
-                        media_group.append(InputMediaVideo(media=media_stream))
-                except requests.exceptions.RequestException as e:
-                    logging.error(f"Failed to download gallery media from {url}: {e}")
-    
-    if media_group:
-        media_group[0].caption = caption
-        media_group[0].parse_mode = constants.ParseMode.MARKDOWN_V2
+            url = meta['s']['u']
 
-    return media_group
+            media_type = 'photo'
+            if meta['e'] == 'RedditVideo':
+                media_type = 'video'
+                url = submission.media['reddit_video']['fallback_url'].split("?")[0]
+            elif meta['e'] == 'AnimatedImage':
+                media_type = 'gif'
+                url = meta['s']['gif']
 
+            # Clean URL to prevent issues with Telegram's API
+            clean_url = url.split("?")[0]
+            media_list.append((clean_url, media_type))
+    elif submission.is_video:
+        url = submission.media['reddit_video']['fallback_url'].split("?")[0]
+        media_list.append((url, 'video'))
+    elif submission.url.endswith(('jpg', 'jpeg', 'png')):
+        media_list.append((submission.url, 'photo'))
+    elif submission.url.endswith(('gif', 'gifv')):
+        media_list.append((submission.url, 'gif'))
 
-async def send_post_to_telegram(submission, topic_id):
-    global sent_posts
-    
-    comments_str = get_post_comments(submission)
-    caption = get_post_caption(submission, comments_str)
-    
+    return media_list
+
+def send_to_telegram(bot, chat_id, topic_id, submission, media_list):
+    """
+    Sends a post to Telegram, handling different media types.
+    """
+    title = escape_html_text(submission.title)
+    author = escape_html_text(str(submission.author))
+    post_link = f"https://reddit.com{submission.permalink}"
+    comments_text = get_top_comments(submission)
+
+    # Base caption for all media types
+    caption = (
+        f"<b>New Post from r/{submission.subreddit.display_name}</b>\n"
+        f"<b>Title</b>: {title}\n"
+        f"<b>Author</b>: u/{author}\n\n"
+        f"<b>Link</b>: <a href='{post_link}'>Click to view post</a>\n\n"
+    )
+
+    if comments_text:
+        caption += f"<b>Top Comments:</b>\n{comments_text}"
+
     try:
-        if hasattr(submission, 'is_gallery') and submission.is_gallery:
-            media_group = await get_gallery_media(submission, caption)
+        if len(media_list) > 1:
+            media_group = []
+            for i, (url, media_type) in enumerate(media_list):
+                try:
+                    # Download media into memory
+                    response = requests.get(url)
+                    response.raise_for_status()
+
+                    if media_type == 'video':
+                        media_group.append(InputMediaVideo(media=response.content, caption=caption if i == 0 else "", parse_mode=ParseMode.HTML))
+                    else:
+                        media_group.append(InputMediaPhoto(media=response.content, caption=caption if i == 0 else "", parse_mode=ParseMode.HTML))
+
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Failed to download media from {url}: {e}")
+                    return
+
             if media_group:
-                await bot.send_media_group(
-                    chat_id=TELEGRAM_GROUP_ID,
+                bot.send_media_group(
+                    chat_id=chat_id,
                     media=media_group,
                     message_thread_id=topic_id
                 )
+        elif media_list:
+            url, media_type = media_list[0]
+            response = requests.get(url)
+            response.raise_for_status()
+
+            if media_type == 'video':
+                bot.send_video(
+                    chat_id=chat_id,
+                    video=response.content,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    message_thread_id=topic_id
+                )
+            elif media_type == 'gif':
+                bot.send_animation(
+                    chat_id=chat_id,
+                    animation=response.content,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    message_thread_id=topic_id
+                )
             else:
-                logging.warning(f"Gallery post {submission.id} has no valid media.")
-
-        elif submission.is_video:
-            media_url = get_post_media_url(submission)
-            if media_url:
-                await bot.send_video(
-                    chat_id=TELEGRAM_GROUP_ID,
-                    video=media_url,
+                bot.send_photo(
+                    chat_id=chat_id,
+                    photo=response.content,
                     caption=caption,
-                    parse_mode=constants.ParseMode.MARKDOWN_V2,
-                    message_thread_id=topic_id
-                )
-
-        elif submission.url.endswith(('.gif', '.gifv')):
-            media_url = get_post_media_url(submission)
-            if media_url:
-                await bot.send_animation(
-                    chat_id=TELEGRAM_GROUP_ID,
-                    animation=media_url,
-                    caption=caption,
-                    parse_mode=constants.ParseMode.MARKDOWN_V2,
-                    message_thread_id=topic_id
-                )
-
-        elif submission.url.endswith(('.jpg', '.jpeg', '.png')):
-            media_url = get_post_media_url(submission)
-            if media_url:
-                await bot.send_photo(
-                    chat_id=TELEGRAM_GROUP_ID,
-                    photo=media_url,
-                    caption=caption,
-                    parse_mode=constants.ParseMode.MARKDOWN_V2,
+                    parse_mode=ParseMode.HTML,
                     message_thread_id=topic_id
                 )
         else:
-            logging.info(f"Skipping post {submission.id} as it is not a supported media type.")
-            return
+            logger.info(f"Skipping post {submission.id}: No supported media found.")
 
-        sent_posts.append(submission.id)
-        logging.info(f"Successfully sent post {submission.id} to Telegram.")
-    except Exception as e:
-        logging.error(f"Failed to send post {submission.id} to Telegram: {e}")
+    except telegram.error.TelegramError as e:
+        logger.error(f"Failed to send post {submission.id} to Telegram: {e}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to download media for post {submission.id}: {e}")
 
-async def check_new_posts(subreddit_name, topic_id):
-    subreddit = reddit.subreddit(subreddit_name)
-    now = datetime.utcnow()
-    
-    for submission in subreddit.new(limit=25):
-        if submission.created_utc > (now - timedelta(minutes=30)).timestamp():
-            if submission.id not in sent_posts:
-                if (hasattr(submission, 'is_gallery') and submission.is_gallery) or \
-                   (hasattr(submission, 'is_video') and submission.is_video) or \
-                   (submission.url.endswith(('.jpg', '.jpeg', '.png', '.gif', '.gifv', '.mp4'))):
-                    logging.info(f"Found new media post in r/{subreddit_name}: {submission.title}")
-                    await send_post_to_telegram(submission, topic_id)
+# --- Main Bot Logic ---
 
 async def main():
-    logging.info("Successfully connected to Reddit.")
-    logging.info("Successfully connected to Telegram.")
-    logging.info("Starting bot.")
+    """Main function to run the bot."""
+    load_dotenv()
 
-    subreddits_to_check = {}
+    # Retrieve credentials from environment variables
+    try:
+        reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
+        reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET")
+        reddit_username = os.getenv("REDDIT_USERNAME")
+        reddit_password = os.getenv("REDDIT_PASSWORD")
+        telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        telegram_group_id = os.getenv("TELEGRAM_GROUP_ID")
+
+        if not all([reddit_client_id, reddit_client_secret, reddit_username, reddit_password, telegram_token, telegram_group_id]):
+            raise ValueError("Missing one or more required environment variables.")
+
+        telegram_group_id = int(telegram_group_id)
+
+    except (ValueError, TypeError) as e:
+        logger.error(f"Configuration error: {e}. Please check your .env file or environment variables.")
+        sys.exit(1)
+
+    # Connect to Reddit
+    try:
+        reddit = praw.Reddit(
+            client_id=reddit_client_id,
+            client_secret=reddit_client_secret,
+            username=reddit_username,
+            password=reddit_password,
+            user_agent="Reddit to Telegram Bot v1.0"
+        )
+        logger.info("Successfully connected to Reddit.")
+    except Exception as e:
+        logger.error(f"Failed to connect to Reddit: {e}")
+        sys.exit(1)
+
+    # Connect to Telegram
+    try:
+        bot = telegram.Bot(token=telegram_token)
+        logger.info("Successfully connected to Telegram.")
+    except Exception as e:
+        logger.error(f"Failed to connect to Telegram: {e}")
+        sys.exit(1)
+
+    logger.info("Starting bot.")
+
+    processed_posts = set()
+    subreddits_config = {}
+
     try:
         with open("subreddits.db", "r") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith('#'):
-                    subreddit, topic = line.split(',')
-                    subreddits_to_check[subreddit.strip()] = int(topic.strip())
-        logging.info(f"Loaded {len(subreddits_to_check)} subreddits from configuration.")
-    except FileNotFoundError:
-        logging.error("subreddits.db not found. Please create it.")
-        return
-    except Exception as e:
-        logging.error(f"Error reading subreddits.db: {e}")
-        return
+                    subreddit, topic_id = line.split(',')
+                    subreddits_config[subreddit.strip()] = int(topic_id.strip())
 
-    while True:
-        start_time = time.time()
-        for subreddit_name, topic_id in subreddits_to_check.items():
-            logging.info(f"Checking r/{subreddit_name} for new posts...")
-            await check_new_posts(subreddit_name, topic_id)
-        
-        loop_duration = time.time() - start_time
-        sleep_time = CHECK_INTERVAL_SECONDS - loop_duration
-        logging.info(f"Loop finished in {loop_duration:.2f} seconds. Sleeping for {sleep_time:.2f} seconds.")
-        if sleep_time > 0:
-            await asyncio.sleep(sleep_time)
+        logger.info(f"Loaded {len(subreddits_config)} subreddits from configuration.")
+    except FileNotFoundError:
+        logger.error("subreddits.db file not found. Please create it.")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Error reading subreddits.db: {e}")
+        sys.exit(1)
+    
+    # Continuously monitor subreddits using a stream
+    subreddit_stream = reddit.subreddit('+'.join(subreddits_config.keys()))
+    
+    logger.info("Starting to monitor subreddits in real-time...")
+    
+    try:
+        for submission in subreddit_stream.stream.submissions(skip_existing=True):
+            logger.info(f"Found new submission: {submission.id} in r/{submission.subreddit.display_name}")
+            
+            subreddit_name = submission.subreddit.display_name
+            topic_id = subreddits_config.get(subreddit_name)
+            
+            if topic_id is not None:
+                try:
+                    media_list = get_media_urls(submission)
+                    if media_list:
+                        logger.info(f"Found new media post in r/{subreddit_name}: {submission.title}")
+                        await send_to_telegram(bot, telegram_group_id, topic_id, submission, media_list)
+                        logger.info(f"Successfully sent post {submission.id} to Telegram.")
+                    
+                except Exception as e:
+                    logger.error(f"An error occurred while processing post {submission.id}: {e}")
+    except Exception as e:
+        logger.error(f"An error occurred in the submission stream: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
