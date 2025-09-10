@@ -50,35 +50,40 @@ def escape_markdown_v2_text(text):
     escaped_text = re.sub(f'([{re.escape(reserved_chars)}])', r'\\\1', text)
     return escaped_text
 
+def clean_url(url):
+    return url.split('?')[0]
+
 def get_post_media_url(submission):
     if submission.is_self:
         return None
+    
     if submission.is_video:
         if hasattr(submission.media, 'get') and submission.media.get('reddit_video'):
-            return submission.media['reddit_video']['fallback_url']
-    if submission.url.endswith(('jpg', 'jpeg', 'png')):
-        return submission.url
-    if submission.url.endswith(('gif', 'gifv')):
-        return submission.url
-    if hasattr(submission, 'preview') and 'images' in submission.preview:
-        for image in submission.preview['images']:
-            if 'variants' in image and 'gif' in image['variants']:
-                return image['variants']['gif']['source']['url']
+            return clean_url(submission.media['reddit_video']['fallback_url'])
+
+    if hasattr(submission, 'url'):
+        clean_media_url = clean_url(submission.url)
+        if clean_media_url.endswith(('jpg', 'jpeg', 'png', 'gif', 'gifv', 'mp4')):
+            return clean_media_url
+        
     return None
 
 def get_post_comments(submission):
     comments_str = ""
-    submission.comments.replace_more(limit=0)
-    comments = submission.comments.list()
-    if comments:
-        for i in range(min(3, len(comments))):
-            comment = comments[i]
-            if comment and hasattr(comment, 'author') and comment.author:
-                author_text = f"u/{comment.author.name}"
-                body_text = comment.body.strip()
-                escaped_author = escape_markdown_v2_text(author_text)
-                escaped_body = escape_markdown_v2_text(body_text)
-                comments_str += f"**{escaped_author}**: {escaped_body}\n"
+    try:
+        submission.comments.replace_more(limit=0)
+        comments = submission.comments.list()
+        if comments:
+            for i in range(min(3, len(comments))):
+                comment = comments[i]
+                if comment and hasattr(comment, 'author') and comment.author:
+                    author_text = f"u/{comment.author.name}"
+                    body_text = comment.body.strip()
+                    escaped_author = escape_markdown_v2_text(author_text)
+                    escaped_body = escape_markdown_v2_text(body_text)
+                    comments_str += f"**{escaped_author}**: {escaped_body}\n"
+    except Exception as e:
+        logging.error(f"Failed to retrieve comments for post {submission.id}: {e}")
     return comments_str
 
 def get_post_caption(submission, comments_str):
@@ -115,7 +120,7 @@ def get_gallery_media(submission):
             file_type = meta['m']
             
             if 'p' in meta and 'u' in meta['p'][-1]:
-                url = meta['p'][-1]['u']
+                url = clean_url(meta['p'][-1]['u'])
                 
                 if file_type.startswith('image'):
                     media.append(InputMediaPhoto(media=url))
