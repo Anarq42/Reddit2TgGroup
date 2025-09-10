@@ -3,6 +3,8 @@ import time
 import logging
 import asyncio
 import re
+import io
+import requests
 from datetime import datetime, timedelta
 import praw
 from telegram import Bot, InputMediaPhoto, InputMediaVideo, constants
@@ -50,21 +52,17 @@ def escape_markdown_v2_text(text):
     escaped_text = re.sub(f'([{re.escape(reserved_chars)}])', r'\\\1', text)
     return escaped_text
 
-def clean_url(url):
-    return url.split('?')[0]
-
 def get_post_media_url(submission):
     if submission.is_self:
         return None
     
     if submission.is_video:
         if hasattr(submission.media, 'get') and submission.media.get('reddit_video'):
-            return clean_url(submission.media['reddit_video']['fallback_url'])
+            return submission.media['reddit_video']['fallback_url'].split('?')[0]
 
     if hasattr(submission, 'url'):
-        clean_media_url = clean_url(submission.url)
-        if clean_media_url.endswith(('jpg', 'jpeg', 'png', 'gif', 'gifv', 'mp4')):
-            return clean_media_url
+        if submission.url.endswith(('.jpg', '.jpeg', '.png', '.gif', '.gifv', '.mp4')):
+            return submission.url.split('?')[0]
         
     return None
 
@@ -102,17 +100,37 @@ def get_post_caption(submission, comments_str):
         f"**Link**: [Click to view post]({escaped_link})",
     ]
     if comments_str:
-        caption_parts.append("**Top Comments:**")
+        caption_parts.append("\n**Top Comments:**")
         caption_parts.append(comments_str)
         
     caption = "\n".join(caption_parts)
     return caption
 
-def get_gallery_media(submission):
-    media = []
+async def send_media(media_url, telegram_method, chat_id, caption, topic_id):
+    try:
+        response = requests.get(media_url, stream=True)
+        response.raise_for_status()
+        media_stream = io.BytesIO(response.content)
+        await telegram_method(
+            chat_id=chat_id,
+            media=media_stream,
+            caption=caption,
+            parse_mode=constants.ParseMode.MARKDOWN_V2,
+            message_thread_id=topic_id
+        )
+        return True
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to download media from {media_url}: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"Failed to send media via {telegram_method.__name__}: {e}")
+        return False
+
+async def get_gallery_media(submission, caption):
+    media_group = []
     if not hasattr(submission, 'gallery_data'):
-        return media
-    
+        return media_group
+
     for item in submission.gallery_data['items']:
         media_id = item['media_id']
         if media_id in submission.media_metadata:
@@ -120,13 +138,25 @@ def get_gallery_media(submission):
             file_type = meta['m']
             
             if 'p' in meta and 'u' in meta['p'][-1]:
-                url = clean_url(meta['p'][-1]['u'])
-                
-                if file_type.startswith('image'):
-                    media.append(InputMediaPhoto(media=url))
-                elif file_type.startswith('video'):
-                    media.append(InputMediaVideo(media=url))
-    return media
+                url = meta['p'][-1]['u'].split('?')[0]
+                try:
+                    response = requests.get(url, stream=True)
+                    response.raise_for_status()
+                    media_stream = io.BytesIO(response.content)
+                    
+                    if file_type.startswith('image'):
+                        media_group.append(InputMediaPhoto(media=media_stream))
+                    elif file_type.startswith('video'):
+                        media_group.append(InputMediaVideo(media=media_stream))
+                except requests.exceptions.RequestException as e:
+                    logging.error(f"Failed to download gallery media from {url}: {e}")
+    
+    if media_group:
+        media_group[0].caption = caption
+        media_group[0].parse_mode = constants.ParseMode.MARKDOWN_V2
+
+    return media_group
+
 
 async def send_post_to_telegram(submission, topic_id):
     global sent_posts
@@ -136,10 +166,8 @@ async def send_post_to_telegram(submission, topic_id):
     
     try:
         if hasattr(submission, 'is_gallery') and submission.is_gallery:
-            media_group = get_gallery_media(submission)
+            media_group = await get_gallery_media(submission, caption)
             if media_group:
-                media_group[0].caption = caption
-                media_group[0].parse_mode = constants.ParseMode.MARKDOWN_V2
                 await bot.send_media_group(
                     chat_id=TELEGRAM_GROUP_ID,
                     media=media_group,
@@ -159,7 +187,7 @@ async def send_post_to_telegram(submission, topic_id):
                     message_thread_id=topic_id
                 )
 
-        elif submission.url.endswith(('.gif', '.gifv')) or (hasattr(submission, 'preview') and 'images' in submission.preview):
+        elif submission.url.endswith(('.gif', '.gifv')):
             media_url = get_post_media_url(submission)
             if media_url:
                 await bot.send_animation(
@@ -198,7 +226,7 @@ async def check_new_posts(subreddit_name, topic_id):
             if submission.id not in sent_posts:
                 if (hasattr(submission, 'is_gallery') and submission.is_gallery) or \
                    (hasattr(submission, 'is_video') and submission.is_video) or \
-                   (submission.url.endswith(('.jpg', '.jpeg', '.png', '.gif', '.gifv'))):
+                   (submission.url.endswith(('.jpg', '.jpeg', '.png', '.gif', '.gifv', '.mp4'))):
                     logging.info(f"Found new media post in r/{subreddit_name}: {submission.title}")
                     await send_post_to_telegram(submission, topic_id)
 
