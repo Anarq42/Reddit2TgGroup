@@ -124,27 +124,32 @@ async def send_to_telegram(bot, chat_id, topic_id, submission, media_list, error
 
     # Headers to mimic a browser request
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Referer': post_link
     }
+    
+    def download_media(url):
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            return response.content
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to download media from {url}: {e}")
+            return None
 
     try:
         if len(media_list) > 1:
             media_group = []
             for i, (url, media_type) in enumerate(media_list):
-                try:
-                    # Download media into memory with browser headers
-                    response = requests.get(url, headers=headers, timeout=10)
-                    response.raise_for_status()
-
-                    if media_type == 'video':
-                        media_group.append(InputMediaVideo(media=response.content, caption=caption if i == 0 else "", parse_mode=ParseMode.HTML))
-                    else:
-                        media_group.append(InputMediaPhoto(media=response.content, caption=caption if i == 0 else "", parse_mode=ParseMode.HTML))
-
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"Failed to download media from {url}: {e}")
-                    await send_error_to_telegram(bot, chat_id, error_topic_id, f"Failed to download media for {submission.id} from {url}: {e}")
+                media_content = download_media(url)
+                if not media_content:
+                    await send_error_to_telegram(bot, chat_id, error_topic_id, f"Failed to download media for gallery post {submission.id} from {url}")
                     return
+
+                if media_type == 'video':
+                    media_group.append(InputMediaVideo(media=media_content, caption=caption if i == 0 else "", parse_mode=ParseMode.HTML))
+                else:
+                    media_group.append(InputMediaPhoto(media=media_content, caption=caption if i == 0 else "", parse_mode=ParseMode.HTML))
 
             if media_group:
                 await bot.send_media_group(
@@ -154,13 +159,15 @@ async def send_to_telegram(bot, chat_id, topic_id, submission, media_list, error
                 )
         elif media_list:
             url, media_type = media_list[0]
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
+            media_content = download_media(url)
+            if not media_content:
+                await send_error_to_telegram(bot, chat_id, error_topic_id, f"Failed to download media for single post {submission.id} from {url}")
+                return
 
             if media_type == 'video':
                 await bot.send_video(
                     chat_id=chat_id,
-                    video=response.content,
+                    video=media_content,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
                     message_thread_id=topic_id
@@ -168,7 +175,7 @@ async def send_to_telegram(bot, chat_id, topic_id, submission, media_list, error
             elif media_type == 'gif':
                 await bot.send_animation(
                     chat_id=chat_id,
-                    animation=response.content,
+                    animation=media_content,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
                     message_thread_id=topic_id
@@ -176,7 +183,7 @@ async def send_to_telegram(bot, chat_id, topic_id, submission, media_list, error
             else:
                 await bot.send_photo(
                     chat_id=chat_id,
-                    photo=response.content,
+                    photo=media_content,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
                     message_thread_id=topic_id
@@ -187,9 +194,9 @@ async def send_to_telegram(bot, chat_id, topic_id, submission, media_list, error
     except telegram.error.TelegramError as e:
         logger.error(f"Failed to send post {submission.id} to Telegram: {e}")
         await send_error_to_telegram(bot, chat_id, error_topic_id, f"Telegram API error for {submission.id}: {e}")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to download media for post {submission.id}: {e}")
-        await send_error_to_telegram(bot, chat_id, error_topic_id, f"Failed to download media for {submission.id}: {e}")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred for post {submission.id}: {e}")
+        await send_error_to_telegram(bot, chat_id, error_topic_id, f"Unexpected error for {submission.id}: {e}")
 
 # --- Main Bot Logic ---
 
