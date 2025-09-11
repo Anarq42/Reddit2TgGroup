@@ -446,7 +446,7 @@ async def stream_submissions(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"An error occurred in the submission stream: {e}. Restarting stream in 10 seconds...")
             await asyncio.sleep(10)
 
-async def main() -> None:
+def main() -> None:
     """Main function to run the bot."""
     load_dotenv()
 
