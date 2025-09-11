@@ -239,7 +239,7 @@ async def send_to_telegram(bot, reddit, chat_id, topic_id, submission, media_lis
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a short description of the bot."""
     await update.message.reply_text(
-        "Hello! I am a bot that forwards new media posts from Reddit to this Telegram group. "
+        "I'm a bot that forwards new media posts from Reddit to this Telegram group. "
         "I'll automatically send photos, videos, and GIFs from the subreddits you've configured."
     )
 
@@ -273,7 +273,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         # Check if subreddit exists
         try:
-            context.job_queue.context['reddit'].subreddit(subreddit_name).id
+            await asyncio.to_thread(context.application.context['reddit'].subreddit, subreddit_name)
         except Exception:
             await update.message.reply_text(f"Subreddit r/{subreddit_name} does not exist or is inaccessible.")
             return
@@ -290,7 +290,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Added r/{subreddit_name} to the watchlist. The bot will restart its stream to apply changes.")
         
         # Restart the stream
-        context.job_queue.context['restart_flag'] = True
+        context.application.context['restart_flag'] = True
     
     except ValueError:
         await update.message.reply_text("Invalid Topic ID. Please provide a valid integer.")
@@ -313,8 +313,8 @@ async def comments_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     
     try:
-        reddit = context.job_queue.context['reddit']
-        submission_id = reddit.submission(url=post_link).id
+        reddit = context.application.context['reddit']
+        submission_id = await asyncio.to_thread(reddit.submission, url=post_link).id
         submission = await asyncio.to_thread(reddit.submission, id=submission_id)
         
         comments_text = get_top_comments(submission, num_comments=5, last_hours=12)
@@ -344,7 +344,7 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if match:
         submission_id = match.group(1)
         try:
-            reddit = context.job_queue.context['reddit']
+            reddit = context.application.context['reddit']
             await update.message.reply_text(f"Reloading post with ID: {submission_id}...", reply_to_message_id=update.message.message_id)
 
             submission = await asyncio.to_thread(reddit.submission, id=submission_id)
@@ -379,7 +379,7 @@ async def handle_reddit_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if match:
         submission_id = match.group(1)
         try:
-            reddit = context.job_queue.context['reddit']
+            reddit = context.application.context['reddit']
             submission = await asyncio.to_thread(reddit.submission, id=submission_id)
             
             # Check if post has media
@@ -410,13 +410,13 @@ async def handle_reddit_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.error(f"Failed to process Reddit link from message: {e}")
             await update.message.reply_text("An error occurred while trying to send the post.")
 
-async def stream_submissions(app):
+async def stream_submissions(app: Application):
     """Monitors Reddit for new submissions and sends them to Telegram."""
-    reddit = app.job_queue.context['reddit']
+    reddit = app.context['reddit']
     bot = app.bot
-    subreddits_config = app.job_queue.context['subreddits_config']
-    telegram_group_id = app.job_queue.context['telegram_group_id']
-    telegram_error_topic_id = app.job_queue.context['telegram_error_topic_id']
+    subreddits_config = app.context['subreddits_config']
+    telegram_group_id = app.context['telegram_group_id']
+    telegram_error_topic_id = app.context['telegram_error_topic_id']
     
     while True:
         try:
@@ -424,8 +424,8 @@ async def stream_submissions(app):
             logger.info("Starting to monitor subreddits in real-time...")
             
             for submission in subreddit_stream:
-                if 'restart_flag' in app.job_queue.context and app.job_queue.context['restart_flag']:
-                    app.job_queue.context['restart_flag'] = False
+                if 'restart_flag' in app.context and app.context['restart_flag']:
+                    app.context['restart_flag'] = False
                     logger.info("Restarting stream to load new subreddits...")
                     break
                 
@@ -435,7 +435,7 @@ async def stream_submissions(app):
                     logger.info(f"Skipping post {submission.id}: already processed.")
                     continue
                 
-                topic_id = subreddits_config.get(submission.subreddit.display_name)
+                topic_id = subreddits_config.get(submission.subreddit.display_name.lower())
                 
                 if topic_id is not None:
                     media_list = get_media_urls(submission)
@@ -494,7 +494,7 @@ async def main() -> None:
 
     # Connect to Telegram
     try:
-        application = Application.builder().token(telegram_token).build()
+        application = Application.builder().token(telegram_token).read_timeout(10).write_timeout(10).build()
         logger.info("Successfully connected to Telegram.")
     except Exception as e:
         logger.error(f"Failed to connect to Telegram: {e}")
@@ -521,11 +521,11 @@ async def main() -> None:
         sys.exit(1)
 
     # Store global state in the application context
-    application.job_queue.context['reddit'] = reddit
-    application.job_queue.context['subreddits_config'] = subreddits_config
-    application.job_queue.context['telegram_group_id'] = telegram_group_id
-    application.job_queue.context['telegram_error_topic_id'] = telegram_error_topic_id
-    application.job_queue.context['restart_flag'] = False
+    application.context.reddit = reddit
+    application.context.subreddits_config = subreddits_config
+    application.context.telegram_group_id = telegram_group_id
+    application.context.telegram_error_topic_id = telegram_error_topic_id
+    application.context.restart_flag = False
 
     # Add command handlers
     application.add_handler(CommandHandler("start", start_command))
