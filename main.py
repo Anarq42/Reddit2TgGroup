@@ -230,31 +230,36 @@ async def main():
 
     while True:
         try:
-            # Continuously monitor subreddits using a stream
-            subreddit_stream = reddit.subreddit('+'.join(subreddits_config.keys()))
+            # Use non-blocking stream iteration
+            subreddit_stream = reddit.subreddit('+'.join(subreddits_config.keys())).stream.submissions(skip_existing=True)
             
             logger.info("Starting to monitor subreddits in real-time...")
             
-            for submission in subreddit_stream.stream.submissions(skip_existing=True):
-                logger.info(f"Found new submission: {submission.id} in r/{submission.subreddit.display_name}")
-                
-                subreddit_name = submission.subreddit.display_name
-                topic_id = subreddits_config.get(subreddit_name)
-                
-                if topic_id is not None:
-                    try:
-                        media_list = get_media_urls(submission)
-                        if media_list:
-                            logger.info(f"Found new media post in r/{subreddit_name}: {submission.title}")
-                            await send_to_telegram(bot, telegram_group_id, topic_id, submission, media_list)
-                            logger.info(f"Successfully sent post {submission.id} to Telegram.")
-                        
-                    except Exception as e:
-                        logger.error(f"An error occurred while processing post {submission.id}: {e}")
-        
+            for submission in subreddit_stream:
+                if submission.id not in processed_posts:
+                    logger.info(f"Found new submission: {submission.id} in r/{submission.subreddit.display_name}")
+                    
+                    subreddit_name = submission.subreddit.display_name
+                    topic_id = subreddits_config.get(subreddit_name)
+                    
+                    if topic_id is not None:
+                        try:
+                            media_list = get_media_urls(submission)
+                            if media_list:
+                                logger.info(f"Found new media post in r/{subreddit_name}: {submission.title}")
+                                await send_to_telegram(bot, telegram_group_id, topic_id, submission, media_list)
+                                processed_posts.add(submission.id)
+                                logger.info(f"Successfully sent post {submission.id} to Telegram.")
+                            else:
+                                processed_posts.add(submission.id)
+                                logger.info(f"Skipping post {submission.id} (no supported media).")
+                            
+                        except Exception as e:
+                            logger.error(f"An error occurred while processing post {submission.id}: {e}")
+            
         except Exception as e:
             logger.error(f"An error occurred in the submission stream: {e}. Restarting stream in 10 seconds...")
-            time.sleep(10)
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(main())
