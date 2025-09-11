@@ -1,4 +1,4 @@
 praw
-python-telegram-bot
+python-telegram-botpython-telegram-bot[job-queue]
 requests
 python-dotenv
