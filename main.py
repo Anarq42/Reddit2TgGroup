@@ -540,7 +540,7 @@ async def main() -> None:
     application.job_queue.run_once(stream_submissions, 1)
 
     # Run the bot
-    await application.run_polling()
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
