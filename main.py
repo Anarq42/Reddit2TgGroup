@@ -128,7 +128,8 @@ async def send_to_telegram(bot, reddit, chat_id, topic_id, submission, media_lis
         # Use PRAW's session for Reddit-hosted media to avoid 403 errors
         if "redd.it" in url:
             try:
-                response = reddit.request('GET', url, stream=True)
+                # Use the PRAW session directly for authenticated download
+                response = reddit.s.get(url, stream=True)
                 response.raise_for_status()
                 return response.raw.read()
             except Exception as e:
