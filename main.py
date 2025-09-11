@@ -122,13 +122,18 @@ async def send_to_telegram(bot, chat_id, topic_id, submission, media_list, error
     if comments_text:
         caption += f"<b>Top Comments:</b>\n{comments_text}"
 
+    # Headers to mimic a browser request
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+
     try:
         if len(media_list) > 1:
             media_group = []
             for i, (url, media_type) in enumerate(media_list):
                 try:
-                    # Download media into memory
-                    response = requests.get(url, timeout=10)
+                    # Download media into memory with browser headers
+                    response = requests.get(url, headers=headers, timeout=10)
                     response.raise_for_status()
 
                     if media_type == 'video':
@@ -138,7 +143,7 @@ async def send_to_telegram(bot, chat_id, topic_id, submission, media_list, error
 
                 except requests.exceptions.RequestException as e:
                     logger.error(f"Failed to download media from {url}: {e}")
-                    await send_error_to_telegram(bot, chat_id, error_topic_id, f"Failed to download media for {submission.id}: {e}")
+                    await send_error_to_telegram(bot, chat_id, error_topic_id, f"Failed to download media for {submission.id} from {url}: {e}")
                     return
 
             if media_group:
@@ -149,7 +154,7 @@ async def send_to_telegram(bot, chat_id, topic_id, submission, media_list, error
                 )
         elif media_list:
             url, media_type = media_list[0]
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
 
             if media_type == 'video':
