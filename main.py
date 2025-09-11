@@ -3,6 +3,7 @@ import sys
 import time
 import logging
 import requests
+import asyncio
 from dotenv import load_dotenv
 import telegram
 import praw
@@ -79,7 +80,7 @@ def get_media_urls(submission):
 
     return media_list
 
-def send_to_telegram(bot, chat_id, topic_id, submission, media_list):
+async def send_to_telegram(bot, chat_id, topic_id, submission, media_list):
     """
     Sends a post to Telegram, handling different media types.
     """
@@ -105,7 +106,7 @@ def send_to_telegram(bot, chat_id, topic_id, submission, media_list):
             for i, (url, media_type) in enumerate(media_list):
                 try:
                     # Download media into memory
-                    response = requests.get(url)
+                    response = requests.get(url, timeout=10)
                     response.raise_for_status()
 
                     if media_type == 'video':
@@ -118,18 +119,18 @@ def send_to_telegram(bot, chat_id, topic_id, submission, media_list):
                     return
 
             if media_group:
-                bot.send_media_group(
+                await bot.send_media_group(
                     chat_id=chat_id,
                     media=media_group,
                     message_thread_id=topic_id
                 )
         elif media_list:
             url, media_type = media_list[0]
-            response = requests.get(url)
+            response = requests.get(url, timeout=10)
             response.raise_for_status()
 
             if media_type == 'video':
-                bot.send_video(
+                await bot.send_video(
                     chat_id=chat_id,
                     video=response.content,
                     caption=caption,
@@ -137,7 +138,7 @@ def send_to_telegram(bot, chat_id, topic_id, submission, media_list):
                     message_thread_id=topic_id
                 )
             elif media_type == 'gif':
-                bot.send_animation(
+                await bot.send_animation(
                     chat_id=chat_id,
                     animation=response.content,
                     caption=caption,
@@ -145,7 +146,7 @@ def send_to_telegram(bot, chat_id, topic_id, submission, media_list):
                     message_thread_id=topic_id
                 )
             else:
-                bot.send_photo(
+                await bot.send_photo(
                     chat_id=chat_id,
                     photo=response.content,
                     caption=caption,
@@ -226,33 +227,34 @@ async def main():
     except Exception as e:
         logger.error(f"Error reading subreddits.db: {e}")
         sys.exit(1)
-    
-    # Continuously monitor subreddits using a stream
-    subreddit_stream = reddit.subreddit('+'.join(subreddits_config.keys()))
-    
-    logger.info("Starting to monitor subreddits in real-time...")
-    
-    try:
-        for submission in subreddit_stream.stream.submissions(skip_existing=True):
-            logger.info(f"Found new submission: {submission.id} in r/{submission.subreddit.display_name}")
+
+    while True:
+        try:
+            # Continuously monitor subreddits using a stream
+            subreddit_stream = reddit.subreddit('+'.join(subreddits_config.keys()))
             
-            subreddit_name = submission.subreddit.display_name
-            topic_id = subreddits_config.get(subreddit_name)
+            logger.info("Starting to monitor subreddits in real-time...")
             
-            if topic_id is not None:
-                try:
-                    media_list = get_media_urls(submission)
-                    if media_list:
-                        logger.info(f"Found new media post in r/{subreddit_name}: {submission.title}")
-                        await send_to_telegram(bot, telegram_group_id, topic_id, submission, media_list)
-                        logger.info(f"Successfully sent post {submission.id} to Telegram.")
-                    
-                except Exception as e:
-                    logger.error(f"An error occurred while processing post {submission.id}: {e}")
-    except Exception as e:
-        logger.error(f"An error occurred in the submission stream: {e}")
-        sys.exit(1)
+            for submission in subreddit_stream.stream.submissions(skip_existing=True):
+                logger.info(f"Found new submission: {submission.id} in r/{submission.subreddit.display_name}")
+                
+                subreddit_name = submission.subreddit.display_name
+                topic_id = subreddits_config.get(subreddit_name)
+                
+                if topic_id is not None:
+                    try:
+                        media_list = get_media_urls(submission)
+                        if media_list:
+                            logger.info(f"Found new media post in r/{subreddit_name}: {submission.title}")
+                            await send_to_telegram(bot, telegram_group_id, topic_id, submission, media_list)
+                            logger.info(f"Successfully sent post {submission.id} to Telegram.")
+                        
+                    except Exception as e:
+                        logger.error(f"An error occurred while processing post {submission.id}: {e}")
+        
+        except Exception as e:
+            logger.error(f"An error occurred in the submission stream: {e}. Restarting stream in 10 seconds...")
+            time.sleep(10)
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
