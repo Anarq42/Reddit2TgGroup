@@ -246,7 +246,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Replies with the bot's uptime if the user is the admin."""
     admin_id = os.getenv("TELEGRAM_ADMIN_ID")
     if str(update.effective_user.id) == admin_id:
-        uptime_seconds = time.time() - start_time
+        uptime_seconds = time.time() - context.application.bot_data['start_time']
         days, remainder = divmod(uptime_seconds, 86400)
         hours, remainder = divmod(remainder, 3600)
         minutes, seconds = divmod(remainder, 60)
@@ -268,7 +268,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         # Check if subreddit exists
         try:
-            await asyncio.to_thread(context.application.context['reddit'].subreddit, subreddit_name)
+            await asyncio.to_thread(context.application.bot_data['reddit'].subreddit, subreddit_name)
         except Exception:
             await update.message.reply_text(f"Subreddit r/{subreddit_name} does not exist or is inaccessible.")
             return
@@ -285,7 +285,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Added r/{subreddit_name} to the watchlist. The bot will restart its stream to apply changes.")
         
         # Restart the stream
-        context.application.context['restart_flag'] = True
+        context.application.bot_data['restart_flag'] = True
     
     except ValueError:
         await update.message.reply_text("Invalid Topic ID. Please provide a valid integer.")
@@ -308,7 +308,7 @@ async def comments_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     
     try:
-        reddit = context.application.context['reddit']
+        reddit = context.application.bot_data['reddit']
         submission_id = await asyncio.to_thread(reddit.submission, url=post_link).id
         submission = await asyncio.to_thread(reddit.submission, id=submission_id)
         
@@ -339,7 +339,7 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if match:
         submission_id = match.group(1)
         try:
-            reddit = context.application.context['reddit']
+            reddit = context.application.bot_data['reddit']
             await update.message.reply_text(f"Reloading post with ID: {submission_id}...", reply_to_message_id=update.message.message_id)
 
             submission = await asyncio.to_thread(reddit.submission, id=submission_id)
@@ -374,7 +374,7 @@ async def handle_reddit_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if match:
         submission_id = match.group(1)
         try:
-            reddit = context.application.context['reddit']
+            reddit = context.application.bot_data['reddit']
             submission = await asyncio.to_thread(reddit.submission, id=submission_id)
             
             # Check if post has media
@@ -384,7 +384,7 @@ async def handle_reddit_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return
 
             # Check if post is already processed to avoid duplicates
-            if submission_id in processed_posts:
+            if submission_id in context.application.bot_data['processed_posts']:
                 await update.message.reply_text("This post has already been sent.")
                 return
             
@@ -398,20 +398,20 @@ async def handle_reddit_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 media_list,
                 int(os.getenv("TELEGRAM_ERROR_TOPIC_ID", update.effective_chat.id))
             )
-            processed_posts.add(submission.id)
+            context.application.bot_data['processed_posts'].add(submission.id)
             await update.message.reply_text("Post sent!", reply_to_message_id=update.message.message_id)
 
         except Exception as e:
             logger.error(f"Failed to process Reddit link from message: {e}")
             await update.message.reply_text("An error occurred while trying to send the post.")
 
-async def stream_submissions(app: Application):
+async def stream_submissions(context: ContextTypes.DEFAULT_TYPE):
     """Monitors Reddit for new submissions and sends them to Telegram."""
-    reddit = app.context.reddit
-    bot = app.bot
-    subreddits_config = app.context.subreddits_config
-    telegram_group_id = app.context.telegram_group_id
-    telegram_error_topic_id = app.context.telegram_error_topic_id
+    reddit = context.application.bot_data['reddit']
+    bot = context.application.bot
+    subreddits_config = context.application.bot_data['subreddits_config']
+    telegram_group_id = context.application.bot_data['telegram_group_id']
+    telegram_error_topic_id = context.application.bot_data['telegram_error_topic_id']
     
     while True:
         try:
@@ -419,14 +419,14 @@ async def stream_submissions(app: Application):
             logger.info("Starting to monitor subreddits in real-time...")
             
             for submission in subreddit_stream:
-                if 'restart_flag' in app.context and app.context['restart_flag']:
-                    app.context['restart_flag'] = False
+                if 'restart_flag' in context.application.bot_data and context.application.bot_data['restart_flag']:
+                    context.application.bot_data['restart_flag'] = False
                     logger.info("Restarting stream to load new subreddits...")
                     break
                 
                 logger.info(f"Found new submission: {submission.id} in r/{submission.subreddit.display_name}")
                 
-                if submission.id in processed_posts:
+                if submission.id in context.application.bot_data['processed_posts']:
                     logger.info(f"Skipping post {submission.id}: already processed.")
                     continue
                 
@@ -437,7 +437,7 @@ async def stream_submissions(app: Application):
                     if media_list:
                         logger.info(f"Found new media post in r/{submission.subreddit.display_name}: {submission.title}")
                         await send_to_telegram(bot, reddit, telegram_group_id, topic_id, submission, media_list, telegram_error_topic_id)
-                        processed_posts.add(submission.id)
+                        context.application.bot_data['processed_posts'].add(submission.id)
                         logger.info(f"Successfully sent post {submission.id} to Telegram.")
                     else:
                         logger.info(f"Skipping post {submission.id} (no supported media).")
@@ -515,12 +515,14 @@ async def main() -> None:
         logger.error(f"Error reading subreddits.db: {e}")
         sys.exit(1)
 
-    # Store global state in the application context
-    application.context['reddit'] = reddit
-    application.context['subreddits_config'] = subreddits_config
-    application.context['telegram_group_id'] = telegram_group_id
-    application.context['telegram_error_topic_id'] = telegram_error_topic_id
-    application.context['restart_flag'] = False
+    # Store global state in the bot_data dictionary
+    application.bot_data['reddit'] = reddit
+    application.bot_data['subreddits_config'] = subreddits_config
+    application.bot_data['telegram_group_id'] = telegram_group_id
+    application.bot_data['telegram_error_topic_id'] = telegram_error_topic_id
+    application.bot_data['restart_flag'] = False
+    application.bot_data['start_time'] = time.time()
+    application.bot_data['processed_posts'] = set()
 
     # Add command handlers
     application.add_handler(CommandHandler("start", start_command))
