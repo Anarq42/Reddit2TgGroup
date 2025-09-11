@@ -4,6 +4,7 @@ import time
 import logging
 import requests
 import asyncio
+import re
 from dotenv import load_dotenv
 import telegram
 import praw
@@ -51,9 +52,25 @@ def get_media_urls(submission):
     Returns a list of tuples: (media_url, media_type).
     """
     media_list = []
-    is_gallery = hasattr(submission, 'media_metadata') and 'gallery_data' in submission.__dict__
+    
+    url = submission.url
+    
+    # Check for third-party videos and animated GIFs first
+    if submission.is_video:
+        url = submission.media['reddit_video']['fallback_url'].split("?")[0]
+        media_list.append((url, 'video'))
+        return media_list
+    
+    if re.match(r'.*\.(mp4|webm)$', url) or 'gfycat.com' in url or 'redgifs.com' in url or url.endswith('.gifv'):
+        media_list.append((url, 'video'))
+    elif re.match(r'.*\.(gif)$', url):
+        media_list.append((url, 'gif'))
+    # Check for third-party photo URLs
+    elif re.match(r'.*\.(jpg|jpeg|png)$', url):
+        media_list.append((url, 'photo'))
 
-    if is_gallery:
+    # Check for Reddit's native galleries
+    elif hasattr(submission, 'media_metadata') and 'gallery_data' in submission.__dict__:
         for item in submission.gallery_data['items']:
             media_id = item['media_id']
             meta = submission.media_metadata[media_id]
@@ -70,17 +87,22 @@ def get_media_urls(submission):
             # Clean URL to prevent issues with Telegram's API
             clean_url = url.split("?")[0]
             media_list.append((clean_url, media_type))
-    elif submission.is_video:
-        url = submission.media['reddit_video']['fallback_url'].split("?")[0]
-        media_list.append((url, 'video'))
-    elif submission.url.endswith(('jpg', 'jpeg', 'png')):
-        media_list.append((submission.url, 'photo'))
-    elif submission.url.endswith(('gif', 'gifv')):
-        media_list.append((submission.url, 'gif'))
-
+    
     return media_list
 
-async def send_to_telegram(bot, chat_id, topic_id, submission, media_list):
+async def send_error_to_telegram(bot, chat_id, topic_id, error_message):
+    """Sends a formatted error message to Telegram."""
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=topic_id,
+            text=f"<b>An error occurred</b>: <code>{error_message}</code>",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"Failed to send error message to Telegram: {e}")
+
+async def send_to_telegram(bot, chat_id, topic_id, submission, media_list, error_topic_id):
     """
     Sends a post to Telegram, handling different media types.
     """
@@ -116,6 +138,7 @@ async def send_to_telegram(bot, chat_id, topic_id, submission, media_list):
 
                 except requests.exceptions.RequestException as e:
                     logger.error(f"Failed to download media from {url}: {e}")
+                    await send_error_to_telegram(bot, chat_id, error_topic_id, f"Failed to download media for {submission.id}: {e}")
                     return
 
             if media_group:
@@ -158,8 +181,10 @@ async def send_to_telegram(bot, chat_id, topic_id, submission, media_list):
 
     except telegram.error.TelegramError as e:
         logger.error(f"Failed to send post {submission.id} to Telegram: {e}")
+        await send_error_to_telegram(bot, chat_id, error_topic_id, f"Telegram API error for {submission.id}: {e}")
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to download media for post {submission.id}: {e}")
+        await send_error_to_telegram(bot, chat_id, error_topic_id, f"Failed to download media for {submission.id}: {e}")
 
 # --- Main Bot Logic ---
 
@@ -175,11 +200,16 @@ async def main():
         reddit_password = os.getenv("REDDIT_PASSWORD")
         telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
         telegram_group_id = os.getenv("TELEGRAM_GROUP_ID")
+        telegram_error_topic_id = os.getenv("TELEGRAM_ERROR_TOPIC_ID", telegram_group_id)
 
         if not all([reddit_client_id, reddit_client_secret, reddit_username, reddit_password, telegram_token, telegram_group_id]):
             raise ValueError("Missing one or more required environment variables.")
 
         telegram_group_id = int(telegram_group_id)
+        if telegram_error_topic_id:
+            telegram_error_topic_id = int(telegram_error_topic_id)
+        else:
+            telegram_error_topic_id = None
 
     except (ValueError, TypeError) as e:
         logger.error(f"Configuration error: {e}. Please check your .env file or environment variables.")
@@ -209,7 +239,6 @@ async def main():
 
     logger.info("Starting bot.")
 
-    processed_posts = set()
     subreddits_config = {}
 
     try:
@@ -236,26 +265,23 @@ async def main():
             logger.info("Starting to monitor subreddits in real-time...")
             
             for submission in subreddit_stream:
-                if submission.id not in processed_posts:
-                    logger.info(f"Found new submission: {submission.id} in r/{submission.subreddit.display_name}")
-                    
-                    subreddit_name = submission.subreddit.display_name
-                    topic_id = subreddits_config.get(subreddit_name)
-                    
-                    if topic_id is not None:
-                        try:
-                            media_list = get_media_urls(submission)
-                            if media_list:
-                                logger.info(f"Found new media post in r/{subreddit_name}: {submission.title}")
-                                await send_to_telegram(bot, telegram_group_id, topic_id, submission, media_list)
-                                processed_posts.add(submission.id)
-                                logger.info(f"Successfully sent post {submission.id} to Telegram.")
-                            else:
-                                processed_posts.add(submission.id)
-                                logger.info(f"Skipping post {submission.id} (no supported media).")
-                            
-                        except Exception as e:
-                            logger.error(f"An error occurred while processing post {submission.id}: {e}")
+                logger.info(f"Found new submission: {submission.id} in r/{submission.subreddit.display_name}")
+                
+                subreddit_name = submission.subreddit.display_name
+                topic_id = subreddits_config.get(subreddit_name)
+                
+                if topic_id is not None:
+                    try:
+                        media_list = get_media_urls(submission)
+                        if media_list:
+                            logger.info(f"Found new media post in r/{subreddit_name}: {submission.title}")
+                            await send_to_telegram(bot, telegram_group_id, topic_id, submission, media_list, telegram_error_topic_id)
+                            logger.info(f"Successfully sent post {submission.id} to Telegram.")
+                        else:
+                            logger.info(f"Skipping post {submission.id} (no supported media).")
+                        
+                    except Exception as e:
+                        logger.error(f"An error occurred while processing post {submission.id}: {e}")
             
         except Exception as e:
             logger.error(f"An error occurred in the submission stream: {e}. Restarting stream in 10 seconds...")
