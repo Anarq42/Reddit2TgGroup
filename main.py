@@ -41,7 +41,7 @@ def get_top_comments(submission, num_comments=3):
             for comment in top_comments:
                 author = escape_html_text(str(comment.author))
                 body = escape_html_text(comment.body)
-                comments_str += f"<b>{author}</b>: {body}\n\n"
+                comments_str += f"<b>{author}</b>: <code>{body}</code>\n\n"
     except Exception as e:
         logger.error(f"Error fetching comments for post {submission.id}: {e}")
     return comments_str
@@ -53,41 +53,43 @@ def get_media_urls(submission):
     """
     media_list = []
     
-    url = submission.url
-    
-    # Check for third-party videos and animated GIFs first
-    if submission.is_video:
+    # Handle direct video posts from Reddit
+    if hasattr(submission, 'is_video') and submission.is_video:
         url = submission.media['reddit_video']['fallback_url'].split("?")[0]
         media_list.append((url, 'video'))
         return media_list
-    
-    if re.match(r'.*\.(mp4|webm)$', url) or 'gfycat.com' in url or 'redgifs.com' in url or url.endswith('.gifv'):
-        media_list.append((url, 'video'))
-    elif re.match(r'.*\.(gif)$', url):
-        media_list.append((url, 'gif'))
-    # Check for third-party photo URLs
-    elif re.match(r'.*\.(jpg|jpeg|png)$', url):
-        media_list.append((url, 'photo'))
 
+    url = submission.url
+    
+    # Check for third-party videos and animated GIFs first
+    if 'gfycat.com' in url or 'redgifs.com' in url or url.endswith('.gifv'):
+        media_list.append((url, 'video'))
+    elif url.endswith('.gif'):
+        media_list.append((url, 'gif'))
+    
     # Check for Reddit's native galleries
     elif hasattr(submission, 'media_metadata') and 'gallery_data' in submission.__dict__:
         for item in submission.gallery_data['items']:
             media_id = item['media_id']
             meta = submission.media_metadata[media_id]
-            url = meta['s']['u']
-
+            
             media_type = 'photo'
+            best_url = meta['s']['u'] # Fallback to the 'u' key for a high-quality preview
+
             if meta['e'] == 'RedditVideo':
                 media_type = 'video'
-                url = submission.media['reddit_video']['fallback_url'].split("?")[0]
             elif meta['e'] == 'AnimatedImage':
                 media_type = 'gif'
-                url = meta['s']['gif']
-
+                best_url = meta['s']['gif']
+            
             # Clean URL to prevent issues with Telegram's API
-            clean_url = url.split("?")[0]
+            clean_url = best_url.split("?")[0]
             media_list.append((clean_url, media_type))
     
+    # Check for a single, direct image hosted on Reddit
+    elif re.match(r'^https://(i.redd.it|preview.redd.it)/.*\.(jpg|jpeg|png)$', url):
+        media_list.append((url, 'photo'))
+
     return media_list
 
 async def send_error_to_telegram(bot, chat_id, topic_id, error_message):
@@ -102,7 +104,7 @@ async def send_error_to_telegram(bot, chat_id, topic_id, error_message):
     except Exception as e:
         logger.error(f"Failed to send error message to Telegram: {e}")
 
-async def send_to_telegram(bot, chat_id, topic_id, submission, media_list, error_topic_id):
+async def send_to_telegram(bot, reddit, chat_id, topic_id, submission, media_list, error_topic_id):
     """
     Sends a post to Telegram, handling different media types.
     """
@@ -122,20 +124,28 @@ async def send_to_telegram(bot, chat_id, topic_id, submission, media_list, error
     if comments_text:
         caption += f"<b>Top Comments:</b>\n{comments_text}"
 
-    # Headers to mimic a browser request
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Referer': post_link
-    }
-    
     def download_media(url):
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            return response.content
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to download media from {url}: {e}")
-            return None
+        # Use PRAW's session for Reddit-hosted media to avoid 403 errors
+        if "redd.it" in url:
+            try:
+                response = reddit.request('GET', url, stream=True)
+                response.raise_for_status()
+                return response.raw.read()
+            except Exception as e:
+                logger.error(f"Failed to download Reddit media with PRAW's session for {url}: {e}")
+                return None
+        else:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Referer': post_link
+            }
+            try:
+                response = requests.get(url, headers=headers, timeout=10)
+                response.raise_for_status()
+                return response.content
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Failed to download media from {url}: {e}")
+                return None
 
     try:
         if len(media_list) > 1:
@@ -287,7 +297,7 @@ async def main():
                         media_list = get_media_urls(submission)
                         if media_list:
                             logger.info(f"Found new media post in r/{subreddit_name}: {submission.title}")
-                            await send_to_telegram(bot, telegram_group_id, topic_id, submission, media_list, telegram_error_topic_id)
+                            await send_to_telegram(bot, reddit, telegram_group_id, topic_id, submission, media_list, telegram_error_topic_id)
                             logger.info(f"Successfully sent post {submission.id} to Telegram.")
                         else:
                             logger.info(f"Skipping post {submission.id} (no supported media).")
