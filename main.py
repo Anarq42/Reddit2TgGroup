@@ -19,11 +19,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global variables
-start_time = time.time()
-processed_posts = set()
-running_stream = None
-
 # --- Helper Functions ---
 
 def escape_html_text(text):
@@ -412,11 +407,11 @@ async def handle_reddit_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def stream_submissions(app: Application):
     """Monitors Reddit for new submissions and sends them to Telegram."""
-    reddit = app.context['reddit']
+    reddit = app.context.reddit
     bot = app.bot
-    subreddits_config = app.context['subreddits_config']
-    telegram_group_id = app.context['telegram_group_id']
-    telegram_error_topic_id = app.context['telegram_error_topic_id']
+    subreddits_config = app.context.subreddits_config
+    telegram_group_id = app.context.telegram_group_id
+    telegram_error_topic_id = app.context.telegram_error_topic_id
     
     while True:
         try:
@@ -425,7 +420,7 @@ async def stream_submissions(app: Application):
             
             for submission in subreddit_stream:
                 if 'restart_flag' in app.context and app.context['restart_flag']:
-                    app.context['restart_flag'] = False
+                    app.context.restart_flag = False
                     logger.info("Restarting stream to load new subreddits...")
                     break
                 
