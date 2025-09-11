@@ -111,6 +111,31 @@ def get_media_urls(submission):
 
     return media_list
 
+def download_media(reddit, url, post_link):
+    """Downloads media from a URL, using PRAW's session for Reddit-hosted media."""
+    # Use PRAW's session for Reddit-hosted media to avoid 403 errors
+    if "redd.it" in url:
+        try:
+            # Use the PRAW session directly for authenticated download
+            response = reddit.s.get(url, stream=True)
+            response.raise_for_status()
+            return response.raw.read()
+        except Exception as e:
+            logger.error(f"Failed to download Reddit media with PRAW's session for {url}: {e}")
+            return None
+    else:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Referer': post_link
+        }
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            return response.content
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to download media from {url}: {e}")
+            return None
+
 async def send_error_to_telegram(bot, chat_id, topic_id, error_message):
     """Sends a formatted error message to Telegram."""
     try:
@@ -395,7 +420,7 @@ async def stream_submissions(app: Application):
             
             for submission in subreddit_stream:
                 if 'restart_flag' in app.context and app.context['restart_flag']:
-                    app.context.restart_flag = False
+                    app.context['restart_flag'] = False
                     logger.info("Restarting stream to load new subreddits...")
                     break
                 
@@ -491,11 +516,11 @@ async def main() -> None:
         sys.exit(1)
 
     # Store global state in the application context
-    application.context.reddit = reddit
-    application.context.subreddits_config = subreddits_config
-    application.context.telegram_group_id = telegram_group_id
-    application.context.telegram_error_topic_id = telegram_error_topic_id
-    application.context.restart_flag = False
+    application.context['reddit'] = reddit
+    application.context['subreddits_config'] = subreddits_config
+    application.context['telegram_group_id'] = telegram_group_id
+    application.context['telegram_error_topic_id'] = telegram_error_topic_id
+    application.context['restart_flag'] = False
 
     # Add command handlers
     application.add_handler(CommandHandler("start", start_command))
