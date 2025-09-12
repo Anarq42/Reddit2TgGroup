@@ -3,6 +3,7 @@ python-telegram-bot
 requests
 beautifulsoup4
 lxml
+aiohttp
 pillow
 imageio[ffmpeg]
 moviepy
