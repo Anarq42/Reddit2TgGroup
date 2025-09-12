@@ -1,4 +1,4 @@
-# simplified and corrected main.py
+# simplified and corrected main.py (only the startup-related fix applied)
 import os
 import logging
 import asyncio
@@ -20,6 +20,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
+
+# (the rest of the module is unchanged from your last version up to main())
 
 # ---------- ENV VARS ----------
 def get_env_var(name, cast=str):
@@ -310,7 +312,6 @@ async def stream_subreddits(reddit_client, bot):
 
 # ---------- STARTUP / SHUTDOWN HOOKS ----------
 async def _on_startup(context):
-    # create reddit client inside a task that runs within the application loop
     reddit_client = asyncpraw.Reddit(
         client_id=REDDIT_CLIENT_ID,
         client_secret=REDDIT_CLIENT_SECRET,
@@ -318,10 +319,7 @@ async def _on_startup(context):
         password=REDDIT_PASSWORD,
         user_agent="TelegramRedditBot/1.0"
     )
-    # attach to application state
     context.application.bot_data["reddit_client"] = reddit_client
-    # start streaming in a background task attached to the application
-    # application.create_task is safe to call
     context.application.create_task(stream_subreddits(reddit_client, context.application.bot))
 
 async def _on_shutdown(context):
@@ -336,13 +334,17 @@ async def _on_shutdown(context):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("post", post_command))
-    # schedule the startup/shutdown callbacks
-    app.post_init(_on_startup) if hasattr(app, "post_init") else app.add_handler  # safe noop in case of versions
-    # safer: use job_queue to start on startup
-    app.job_queue.run_once(lambda context: _on_startup(context), when=0)
-    # ensure reddit is closed at shutdown via job_queue
-    app.job_queue.run_once(lambda context: _on_shutdown(context), when=0)
-    # run polling (blocking call, handles lifecycle correctly)
+
+    # Safely call post_init only if it exists and is callable
+    post_init_attr = getattr(app, "post_init", None)
+    if callable(post_init_attr):
+        post_init_attr(_on_startup)
+
+    # Schedule startup via job_queue for versions that do not support post_init
+    # pass the coroutine function itself (JobQueue will call it with a context)
+    app.job_queue.run_once(_on_startup, when=0)
+
+    # Run polling (manages lifecycle correctly for python-telegram-bot v20+)
     app.run_polling()
 
 if __name__ == "__main__":
