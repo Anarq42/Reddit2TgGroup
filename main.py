@@ -1,8 +1,11 @@
+# simplified and corrected main.py
 import os
 import logging
 import asyncio
 import aiohttp
 import json
+import re
+import html
 from io import BytesIO
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
 from telegram.constants import ParseMode
@@ -52,7 +55,7 @@ def load_subreddits_mapping(file_path):
                 if len(parts) != 2:
                     continue
                 subreddit_name, topic_id = parts
-                mapping[subreddit_name.strip()] = int(topic_id.strip())
+                mapping[subreddit_name.strip().lower()] = int(topic_id.strip())
     except FileNotFoundError:
         logging.warning(f"{file_path} not found. Starting with empty mapping.")
     return mapping
@@ -63,36 +66,46 @@ subreddit_map = load_subreddits_mapping(SUBREDDITS_DB_PATH)
 def load_posted_ids():
     try:
         with open(POSTED_IDS_PATH, "r") as f:
-            return set(json.load(f))
-    except Exception:
+            data = json.load(f)
+            if isinstance(data, list):
+                return set(data)
+            logging.warning("posted_ids file has unexpected format, starting fresh.")
+            return set()
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        logging.warning(f"Failed loading posted ids: {e}")
         return set()
 
 def save_posted_ids(posted_ids):
-    with open(POSTED_IDS_PATH, "w") as f:
-        json.dump(list(posted_ids), f)
+    try:
+        with open(POSTED_IDS_PATH, "w") as f:
+            json.dump(list(posted_ids), f)
+    except Exception as e:
+        logging.error(f"Failed to save posted ids: {e}")
 
 posted_ids = load_posted_ids()
-
-# ---------- REDDIT INIT ----------
-reddit = asyncpraw.Reddit(
-    client_id=REDDIT_CLIENT_ID,
-    client_secret=REDDIT_CLIENT_SECRET,
-    username=REDDIT_USERNAME,
-    password=REDDIT_PASSWORD,
-    user_agent="TelegramRedditBot/1.0"
-)
+posted_ids_lock = asyncio.Lock()
 
 # ---------- UTILITIES ----------
 def prepare_caption(submission):
     author = submission.author.name if submission.author else "[deleted]"
-    return f"<b>{submission.title}</b>\nPosted by u/{author}\n<a href='{submission.url}'>Reddit Link</a>"
+    # HTML-escape title/author/url
+    safe_title = html.escape(submission.title)
+    safe_author = html.escape(author)
+    safe_url = html.escape(submission.url)
+    return f"<b>{safe_title}</b>\nPosted by u/{safe_author}\n<a href='{safe_url}'>Reddit Link</a>"
 
 async def fetch_bytes(session, url):
     try:
         async with session.get(url) as resp:
             resp.raise_for_status()
             data = await resp.read()
-            return BytesIO(data)
+            bio = BytesIO(data)
+            bio.seek(0)
+            # give a name so telegram can infer content-type if needed
+            bio.name = os.path.basename(url.split("?")[0]) or "file"
+            return bio
     except Exception as e:
         logging.warning(f"Failed to fetch {url}: {e}")
         return None
@@ -104,7 +117,7 @@ async def get_gfy_redgifs_mp4(url):
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as resp:
                 text = await resp.text()
-                soup = BeautifulSoup(text, "lxml")
+                soup = BeautifulSoup(text, "html.parser")
                 mp4_tag = soup.find("source", {"type": "video/mp4"})
                 if mp4_tag and mp4_tag.get("src"):
                     mp4_url = mp4_tag["src"]
@@ -113,8 +126,11 @@ async def get_gfy_redgifs_mp4(url):
                     return mp4_url
                 match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', text)
                 if match:
-                    data = json.loads(match.group(1))
-                    return data.get('gfyItem', {}).get('mp4Url')
+                    try:
+                        data = json.loads(match.group(1))
+                        return data.get('gfyItem', {}).get('mp4Url')
+                    except Exception:
+                        return None
     except Exception as e:
         logging.warning(f"Failed to get mp4 from {url}: {e}")
     return None
@@ -122,25 +138,27 @@ async def get_gfy_redgifs_mp4(url):
 # ---------- MEDIA HANDLING ----------
 async def get_media_urls(submission):
     media_list = []
-
     try:
         # Reddit gallery
         if getattr(submission, 'is_gallery', False):
-            for meta in submission.media_metadata.values():
-                if meta['e'] == 'Image':
-                    url = meta['s']['u'].replace("&amp;", "&")
+            meta = getattr(submission, 'media_metadata', {}) or {}
+            for m in meta.values():
+                if m.get('e') == 'Image' and 's' in m and 'u' in m['s']:
+                    url = m['s']['u'].replace("&amp;", "&")
                     media_list.append({"url": url, "type": "photo"})
 
         # Reddit video
-        elif getattr(submission, 'media', None) and 'reddit_video' in submission.media:
-            media_url = submission.media['reddit_video']['fallback_url']
-            media_list.append({"url": media_url, "type": "video"})
+        elif getattr(submission, 'media', None) and isinstance(submission.media, dict) and 'reddit_video' in submission.media:
+            reddit_video = submission.media['reddit_video']
+            media_url = reddit_video.get('fallback_url')
+            if media_url:
+                media_list.append({"url": media_url, "type": "video"})
 
         # Direct links
-        elif submission.url.endswith((".jpg", ".jpeg", ".png")):
+        elif submission.url.lower().endswith((".jpg", ".jpeg", ".png")):
             media_list.append({"url": submission.url, "type": "photo"})
-        elif submission.url.endswith((".gif", ".mp4")):
-            media_type = "gif" if submission.url.endswith(".gif") else "video"
+        elif submission.url.lower().endswith((".gif", ".mp4")):
+            media_type = "gif" if submission.url.lower().endswith(".gif") else "video"
             media_list.append({"url": submission.url, "type": media_type})
 
         # External hosts
@@ -153,27 +171,25 @@ async def get_media_urls(submission):
                 if mp4_url:
                     media_list.append({"url": mp4_url, "type": "video"})
     except Exception as e:
-        logging.warning(f"Failed to get media URLs for {submission.id}: {e}")
+        logging.warning(f"Failed to get media URLs for {getattr(submission, 'id', '?')}: {e}")
 
     return media_list
 
 # ---------- SEND MEDIA ----------
 async def send_media(submission, media_list, topic_id, bot):
-    if submission.id in posted_ids:
-        logging.info(f"Skipping duplicate post: {submission.title}")
-        return
-    posted_ids.add(submission.id)
-    save_posted_ids(posted_ids)
-
+    # prepare caption first
     caption = prepare_caption(submission)
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
             if media_list:
                 if len(media_list) > 1:
+                    # limit to 10 for groups
                     tg_media = []
+                    # fetch bytes concurrently
                     media_bytes = await asyncio.gather(*(fetch_bytes(session, m['url']) for m in media_list))
-                    for i, media in enumerate(media_list):
+                    for i, media in enumerate(media_list[:10]):
                         bio = media_bytes[i]
                         if bio is None:
                             continue
@@ -189,7 +205,7 @@ async def send_media(submission, media_list, topic_id, bot):
                     bio = await fetch_bytes(session, media["url"])
                     if bio is None:
                         await bot.send_message(chat_id=TELEGRAM_GROUP_ID, message_thread_id=topic_id, text=caption, parse_mode=ParseMode.HTML)
-                        return
+                        return True
                     if media["type"] == "photo":
                         await bot.send_photo(chat_id=TELEGRAM_GROUP_ID, message_thread_id=topic_id, photo=bio, caption=caption, parse_mode=ParseMode.HTML)
                     elif media["type"] == "video":
@@ -199,19 +215,34 @@ async def send_media(submission, media_list, topic_id, bot):
             else:
                 await bot.send_message(chat_id=TELEGRAM_GROUP_ID, message_thread_id=topic_id, text=caption, parse_mode=ParseMode.HTML)
 
-        logging.info(f"Post sent: {submission.title} to topic {topic_id}")
-    except TelegramError as e:
-        logging.error(f"Error sending post: {submission.title} - {e}")
-        await bot.send_message(chat_id=TELEGRAM_ERROR_TOPIC_ID, text=f"Error sending post: {submission.title}\n{e}")
+            logging.info(f"Post sent: {submission.title} to topic {topic_id}")
+            return True
+        except TelegramError as e:
+            logging.error(f"Error sending post: {submission.title} - {e}")
+            try:
+                await bot.send_message(chat_id=TELEGRAM_ERROR_TOPIC_ID, text=f"Error sending post: {submission.title}\n{str(e)[:400]}")
+            except Exception:
+                logging.exception("Failed to send error message to error topic")
+            return False
+        except Exception:
+            logging.exception("Unexpected error while sending media")
+            return False
 
 # ---------- PROCESS REDDIT LINK ----------
-async def send_reddit_link(url, bot):
+async def send_reddit_link(url, bot, reddit_client):
     try:
-        submission_id = Submission.id_from_url(url)
-        submission = await reddit.submission(id=submission_id)
-        topic_id = subreddit_map.get(submission.subreddit.display_name, TELEGRAM_ERROR_TOPIC_ID)
+        # Use reddit.submission(url=...) to get by permalink or full URL
+        submission = await reddit_client.submission(url=url)
+        # ensure subreddit lookup in lowercase keys
+        topic_id = subreddit_map.get(submission.subreddit.display_name.lower(), TELEGRAM_ERROR_TOPIC_ID)
         media_list = await get_media_urls(submission)
-        await send_media(submission, media_list, topic_id, bot)
+        ok = await send_media(submission, media_list, topic_id, bot)
+        if ok:
+            # record posted id, protected by lock
+            async with posted_ids_lock:
+                if submission.id not in posted_ids:
+                    posted_ids.add(submission.id)
+                    save_posted_ids(posted_ids)
         return f"Processed Reddit post: {submission.title}"
     except Exception as e:
         logging.warning(f"Failed to process Reddit URL {url}: {e}")
@@ -223,50 +254,96 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /post <reddit_url>")
         return
     url = context.args[0]
-    msg = await send_reddit_link(url, context.bot)
+    # reddit_client attached to app via context.application.bot_data
+    reddit_client = context.application.bot_data.get("reddit_client")
+    if reddit_client is None:
+        await update.message.reply_text("Reddit client not ready; try again in a moment.")
+        return
+    msg = await send_reddit_link(url, context.bot, reddit_client)
     await update.message.reply_text(msg)
 
 # ---------- STREAM SUBREDDITS ----------
-async def stream_subreddits(bot):
+async def stream_subreddits(reddit_client, bot):
     if not subreddit_map:
         logging.warning("No subreddits configured. Skipping stream.")
         return
 
     subreddit_names = "+".join(subreddit_map.keys())
     try:
-        subreddit = await reddit.subreddit(subreddit_names)
+        subreddit = reddit_client.subreddit(subreddit_names)
     except Exception as e:
         logging.error(f"Failed to access subreddits: {e}")
         return
 
     logging.info(f"Starting subreddit stream: {subreddit_names}")
 
-    async for submission in subreddit.stream.submissions(skip_existing=True):
-        logging.info(f"New submission: {submission.title} (r/{submission.subreddit.display_name})")
-        topic_id = subreddit_map.get(submission.subreddit.display_name, TELEGRAM_ERROR_TOPIC_ID)
+    # resilient loop with simple backoff on errors
+    backoff = 1
+    while True:
         try:
-            media_list = await get_media_urls(submission)
-            await send_media(submission, media_list, topic_id, bot)
+            async for submission in subreddit.stream.submissions(skip_existing=True):
+                logging.info(f"New submission: {submission.title} (r/{submission.subreddit.display_name})")
+                topic_id = subreddit_map.get(submission.subreddit.display_name.lower(), TELEGRAM_ERROR_TOPIC_ID)
+                try:
+                    media_list = await get_media_urls(submission)
+                    ok = await send_media(submission, media_list, topic_id, bot)
+                    if ok:
+                        async with posted_ids_lock:
+                            if submission.id not in posted_ids:
+                                posted_ids.add(submission.id)
+                                save_posted_ids(posted_ids)
+                except Exception:
+                    logging.exception(f"Failed to send submission {submission.title}")
+                    try:
+                        await bot.send_message(chat_id=TELEGRAM_ERROR_TOPIC_ID, text=f"Error sending submission: {submission.title}")
+                    except Exception:
+                        logging.exception("Failed to report error to error topic")
+            # if the async for ends naturally, break
+            break
+        except asyncio.CancelledError:
+            logging.info("stream_subreddits cancelled, exiting")
+            break
         except Exception as e:
-            logging.error(f"Failed to send submission {submission.title}: {e}")
-            await bot.send_message(chat_id=TELEGRAM_ERROR_TOPIC_ID, text=f"Error sending submission: {submission.title}\n{e}")
+            logging.exception(f"Stream error: {e}; backing off for {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
-# ---------- MAIN LOOP ----------
-async def main():
+# ---------- STARTUP / SHUTDOWN HOOKS ----------
+async def _on_startup(context):
+    # create reddit client inside a task that runs within the application loop
+    reddit_client = asyncpraw.Reddit(
+        client_id=REDDIT_CLIENT_ID,
+        client_secret=REDDIT_CLIENT_SECRET,
+        username=REDDIT_USERNAME,
+        password=REDDIT_PASSWORD,
+        user_agent="TelegramRedditBot/1.0"
+    )
+    # attach to application state
+    context.application.bot_data["reddit_client"] = reddit_client
+    # start streaming in a background task attached to the application
+    # application.create_task is safe to call
+    context.application.create_task(stream_subreddits(reddit_client, context.application.bot))
+
+async def _on_shutdown(context):
+    reddit_client = context.application.bot_data.get("reddit_client")
+    if reddit_client:
+        try:
+            await reddit_client.close()
+        except Exception:
+            logging.exception("Error closing reddit client")
+
+# ---------- MAIN (synchronous run) ----------
+def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("post", post_command))
-
-    # Start subreddit stream in background
-    asyncio.create_task(stream_subreddits(app.bot))
-
-    logging.info("Bot started, monitoring subreddits: %s", ", ".join(subreddit_map.keys()))
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    await app.updater.wait_closed()
-    await app.stop()
-    await app.shutdown()
+    # schedule the startup/shutdown callbacks
+    app.post_init(_on_startup) if hasattr(app, "post_init") else app.add_handler  # safe noop in case of versions
+    # safer: use job_queue to start on startup
+    app.job_queue.run_once(lambda context: _on_startup(context), when=0)
+    # ensure reddit is closed at shutdown via job_queue
+    app.job_queue.run_once(lambda context: _on_shutdown(context), when=0)
+    # run polling (blocking call, handles lifecycle correctly)
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
+    main()
