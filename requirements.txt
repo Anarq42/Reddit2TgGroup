@@ -1,5 +1,5 @@
 praw
-python-telegram-bot[job-queue]
+python-telegram-bot
 requests
 beautifulsoup4
 lxml
