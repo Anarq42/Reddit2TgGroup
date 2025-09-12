@@ -201,18 +201,11 @@ async def stream_subreddits():
 # ---------- MAIN LOOP ----------
 async def main():
     app = Application.builder().token(telegram_token).build()
-
-    # Add /post command
     app.add_handler(CommandHandler("post", post_command))
-
     logging.info("Bot started, monitoring subreddits: %s", ", ".join(subreddit_map.keys()))
-
-    # Start subreddit streaming in background
     asyncio.create_task(stream_subreddits())
-
-    # Properly initialize and start polling without new event loop
     await app.initialize()
-    await app.start_polling()
+    await app.updater.start_polling()
     await app.updater.idle()
 
 # ---------- START ----------
