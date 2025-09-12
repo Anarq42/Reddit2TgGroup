@@ -207,11 +207,13 @@ async def main():
 
     logging.info("Bot started, monitoring subreddits: %s", ", ".join(subreddit_map.keys()))
 
-    # Start subreddit streaming as a background task
+    # Start subreddit streaming in background
     asyncio.create_task(stream_subreddits())
 
-    # Run the bot
-    await app.run_polling()
+    # Properly initialize and start polling without new event loop
+    await app.initialize()
+    await app.start_polling()
+    await app.updater.idle()
 
 # ---------- START ----------
 if __name__ == "__main__":
