@@ -3,13 +3,13 @@ import logging
 import asyncio
 import aiohttp
 import re
+import json
 from io import BytesIO
 from telegram import Bot, Update, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import TelegramError
-from praw import Reddit
-from praw.models import Submission
+import asyncpraw
 from bs4 import BeautifulSoup
 
 # ---------- CREDENTIALS ----------
@@ -23,12 +23,15 @@ telegram_error_topic_id = int(os.getenv("TELEGRAM_ERROR_TOPIC_ID"))
 subreddits_db_path = "subreddits.db"
 
 # ---------- LOGGING ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 # ---------- INIT ----------
 bot = Bot(token=telegram_token)
-reddit = Reddit(
+reddit = asyncpraw.Reddit(
     client_id=reddit_client_id,
     client_secret=reddit_client_secret,
     username=reddit_username,
@@ -39,9 +42,6 @@ reddit = Reddit(
 # ---------- LOAD SUBREDDITS ----------
 def load_subreddits_mapping(file_path):
     mapping = {}
-    if not os.path.exists(file_path):
-        logger.warning(f"Subreddit mapping file {file_path} not found")
-        return mapping
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -57,32 +57,38 @@ def load_subreddits_mapping(file_path):
 subreddit_map = load_subreddits_mapping(subreddits_db_path)
 
 # ---------- UTILS ----------
-def prepare_caption(submission: Submission):
+def prepare_caption(submission):
     return f"<b>{submission.title}</b>\nPosted by u/{submission.author}\n<a href='{submission.url}'>Reddit Link</a>"
 
 async def fetch_bytes(session, url):
     async with session.get(url) as resp:
         resp.raise_for_status()
-        data = await resp.read()
-        return BytesIO(data)
+        return BytesIO(await resp.read())
 
 # ---------- MEDIA HANDLING ----------
-async def get_media_urls(submission: Submission):
+async def get_media_urls(submission):
     media_list = []
 
+    # Reddit gallery
     if getattr(submission, 'is_gallery', False):
-        for key, meta in submission.media_metadata.items():
+        for meta in submission.media_metadata.values():
             if meta['e'] == 'Image':
                 url = meta['s']['u'].replace("&amp;", "&")
                 media_list.append({"url": url, "type": "photo"})
+
+    # Reddit video
     elif hasattr(submission, 'media') and submission.media and 'reddit_video' in submission.media:
         media_url = submission.media['reddit_video']['fallback_url']
         media_list.append({"url": media_url, "type": "video"})
+
+    # Direct image/video links
     elif submission.url.endswith((".jpg", ".jpeg", ".png")):
         media_list.append({"url": submission.url, "type": "photo"})
     elif submission.url.endswith((".gif", ".mp4")):
         media_type = "gif" if submission.url.endswith(".gif") else "video"
         media_list.append({"url": submission.url, "type": media_type})
+
+    # External hosts
     else:
         host_url = submission.url.lower()
         if "imgur.com" in host_url and host_url.endswith((".jpg", ".png", ".gif")):
@@ -109,18 +115,17 @@ async def get_gfy_redgifs_mp4(url):
                     return mp4_url
                 json_match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', text)
                 if json_match:
-                    import json
                     data = json.loads(json_match.group(1))
                     try:
                         return data['gfyItem']['mp4Url']
-                    except:
+                    except KeyError:
                         return None
     except Exception as e:
         logger.warning(f"Failed to get mp4 from {url}: {e}")
     return None
 
 # ---------- SEND MEDIA ----------
-async def send_media(submission: Submission, media_list, topic_id):
+async def send_media(submission, media_list, topic_id):
     caption = prepare_caption(submission)
     try:
         if media_list:
@@ -165,7 +170,7 @@ async def send_reddit_link(url: str):
         logger.warning(f"Invalid Reddit URL: {url}")
         return "Invalid Reddit URL"
     submission_id = match.group(1)
-    submission = reddit.submission(id=submission_id)
+    submission = await reddit.submission(id=submission_id)
     topic_id = subreddit_map.get(submission.subreddit.display_name, telegram_error_topic_id)
     media_list = await get_media_urls(submission)
     await send_media(submission, media_list, topic_id)
@@ -182,45 +187,28 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- MAIN STREAM ----------
 async def stream_subreddits():
-    if not subreddit_map:
-        logger.warning("No subreddits to monitor.")
-        return
-
     subreddit_names = "+".join(subreddit_map.keys())
-    subreddit = reddit.subreddit(subreddit_names)
+    subreddit = await reddit.subreddit(subreddit_names)
     logger.info(f"Starting subreddit stream: {subreddit_names}")
 
-    while True:
+    async for submission in subreddit.stream.submissions(skip_existing=True):
+        logger.info(f"New submission detected: {submission.title} (r/{submission.subreddit.display_name})")
+        topic_id = subreddit_map.get(submission.subreddit.display_name, telegram_error_topic_id)
         try:
-            for submission in subreddit.stream.submissions(skip_existing=True, pause_after=0):
-                if submission is None:
-                    await asyncio.sleep(2)
-                    continue
-
-                logger.info(f"New submission detected: {submission.title} (r/{submission.subreddit.display_name})")
-                topic_id = subreddit_map.get(submission.subreddit.display_name, telegram_error_topic_id)
-
-                try:
-                    media_list = await get_media_urls(submission)
-                    await send_media(submission, media_list, topic_id)
-                except Exception as media_err:
-                    logger.error(f"Failed to send submission {submission.title}: {media_err}")
-                    await bot.send_message(chat_id=telegram_error_topic_id,
-                                           text=f"Error sending submission: {submission.title}\n{media_err}")
-
-        except Exception as e:
-            logger.error(f"Stream error: {e}. Restarting in 10s...")
-            await asyncio.sleep(10)
+            media_list = await get_media_urls(submission)
+            await send_media(submission, media_list, topic_id)
+            logger.info(f"Post sent successfully: {submission.title} to topic {topic_id}")
+        except Exception as media_err:
+            logger.error(f"Failed to send submission {submission.title}: {media_err}")
+            await bot.send_message(chat_id=telegram_error_topic_id,
+                                   text=f"Error sending submission: {submission.title}\n{media_err}")
 
 # ---------- MAIN LOOP ----------
 async def main():
     app = Application.builder().token(telegram_token).build()
     app.add_handler(CommandHandler("post", post_command))
-    logger.info("Bot started, monitoring subreddits: %s", ", ".join(subreddit_map.keys()))
     asyncio.create_task(stream_subreddits())
-    await app.initialize()
-    await app.updater.start_polling()
-    await app.updater.idle()
+    app.run_polling()
 
 # ---------- START ----------
 if __name__ == "__main__":
