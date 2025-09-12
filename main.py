@@ -18,8 +18,8 @@ reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET")
 reddit_username = os.getenv("REDDIT_USERNAME")
 reddit_password = os.getenv("REDDIT_PASSWORD")
 telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
-telegram_group_id = int(os.getenv("TELEGRAM_GROUP_ID"))  # Main group ID
-telegram_error_topic_id = int(os.getenv("TELEGRAM_ERROR_TOPIC_ID"))  # Fallback topic
+telegram_group_id = int(os.getenv("TELEGRAM_GROUP_ID"))
+telegram_error_topic_id = int(os.getenv("TELEGRAM_ERROR_TOPIC_ID"))
 subreddits_db_path = "subreddits.db"
 
 # ---------- LOGGING ----------
@@ -91,9 +91,8 @@ async def get_media_urls(submission: Submission):
     # External hosts
     else:
         host_url = submission.url.lower()
-        if "imgur.com" in host_url:
-            if host_url.endswith((".jpg", ".png", ".gif")):
-                media_list.append({"url": submission.url, "type": "photo"})
+        if "imgur.com" in host_url and host_url.endswith((".jpg", ".png", ".gif")):
+            media_list.append({"url": submission.url, "type": "photo"})
         elif "gfycat.com" in host_url or "redgifs.com" in host_url:
             mp4_url = await get_gfy_redgifs_mp4(submission.url)
             if mp4_url:
@@ -214,5 +213,17 @@ async def main():
     # Run the bot
     await app.run_polling()
 
+# ---------- START ----------
 if __name__ == "__main__":
-    asyncio.run(main())
+    async def runner():
+        await main()
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        asyncio.create_task(runner())
+    else:
+        asyncio.run(runner())
