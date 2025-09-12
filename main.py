@@ -4,7 +4,7 @@ import asyncio
 import aiohttp
 import re
 from io import BytesIO
-from telegram import Bot, Update, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
+from telegram import Bot, Update, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import TelegramError
@@ -208,7 +208,7 @@ async def main():
     app.add_handler(CommandHandler("post", post_command))
 
     # Start subreddit stream in background
-    app.job_queue.run_once(lambda _: asyncio.create_task(stream_subreddits()), 0)
+    asyncio.create_task(stream_subreddits())
 
     logging.info("Bot started, monitoring subreddits: %s", ", ".join(subreddit_map.keys()))
     
@@ -216,10 +216,13 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
+
+    # Keep running until stopped
     await app.updater.wait_closed()
+
+    # Shutdown
     await app.stop()
     await app.shutdown()
 
 if __name__ == "__main__":
-    # Run main in the current loop
-    asyncio.get_event_loop().run_until_complete(main())
+    asyncio.run(main())
