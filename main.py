@@ -1,732 +1,147 @@
 import os
-import sys
-import time
 import logging
+import time
 import requests
-import asyncio
-import re
-from dotenv import load_dotenv
-import praw
-from telegram import InputMediaPhoto, InputMediaVideo, Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes  # Removed ApplicationHandler
+import sqlite3
+from io import BytesIO
+from telegram import Bot, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
+from telegram.error import TelegramError
 from telegram.constants import ParseMode
+from praw import Reddit
+from praw.models import Submission
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# ---------- CREDENTIALS ----------
+reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
+reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET")
+reddit_username = os.getenv("REDDIT_USERNAME")
+reddit_password = os.getenv("REDDIT_PASSWORD")
+telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+telegram_error_topic_id = os.getenv("TELEGRAM_ERROR_TOPIC_ID")
+subreddits_db_path = "subreddits.db"
 
-# --- Helper Functions ---
-def escape_html_text(text):
-    """Escapes HTML special characters in a string."""
-    if text is None:
-        return ""
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+# ---------- LOGGING ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-def get_top_comments(submission, num_comments=5, last_hours=12):
-    """Fetches and formats top/recent comments."""
-    comments_str = ""
-    comment_ids = set()
-    try:
-        submission.comments.replace_more(limit=None)
-        comments_list = submission.comments.list()
-        
-        twelve_hours_ago = time.time() - (last_hours * 3600)
-        recent_comments = [c for c in comments_list if c.created_utc >= twelve_hours_ago]
-        
-        combined_comments = sorted(comments_list, key=lambda c: c.score, reverse=True)[:num_comments]
-        # Add recent comments not already in the top list
-        for comment in recent_comments:
-            if comment.id not in comment_ids:
-                combined_comments.append(comment)
-                comment_ids.add(comment.id)
-                if len(combined_comments) >= num_comments + len(recent_comments):
-                    break
-        
-        for comment in combined_comments:
-            if comment.id not in comment_ids:
-                author = escape_html_text(str(comment.author))
-                body = escape_html_text(comment.body)
-                comments_str += f"<b>{author}</b>: <code>{body}</code>\n\n"
-                comment_ids.add(comment.id)
-    except Exception as e:
-        logger.error(f"Error fetching comments for post {submission.id}: {e}")
-    return comments_str
+# ---------- INIT ----------
+bot = Bot(token=telegram_token)
+reddit = Reddit(
+    client_id=reddit_client_id,
+    client_secret=reddit_client_secret,
+    username=reddit_username,
+    password=reddit_password,
+    user_agent="TelegramRedditBot/1.0"
+)
 
-def get_media_urls(submission):
-    """Extracts media URLs with proper validation."""
+# ---------- LOAD SUBREDDITS ----------
+def load_subreddits_mapping(db_path):
+    """
+    Returns a dict: {subreddit_name: telegram_group_id}
+    Assumes subreddits.db has table 'subreddits' with columns: name, telegram_group_id
+    """
+    mapping = {}
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, telegram_group_id FROM subreddits")
+    for row in cursor.fetchall():
+        subreddit_name, group_id = row
+        mapping[subreddit_name.strip()] = group_id.strip()
+    conn.close()
+    return mapping
+
+# ---------- MEDIA HANDLING ----------
+def get_media_urls(submission: Submission):
     media_list = []
-    url = submission.url
 
-    # Direct Reddit video
-    if hasattr(submission, 'is_video') and submission.is_video:
-        media_data = submission.media.get('reddit_video', {})
-        if 'fallback_url' not in media_data:
-            logger.error(f"Missing fallback URL for video post {submission.id}")
-            return media_list
-        media_list.append((media_data['fallback_url'], 'video'))
-        return media_list
-
-    # Third-party video/GIF
-    if 'gfycat.com' in url or 'redgifs.com' in url or url.endswith('.gifv'):
-        media_list.append((url, 'video'))
-    elif url.endswith('.gif'):
-        media_list.append((url, 'gif'))
     # Reddit gallery
-    elif hasattr(submission, 'media_metadata') and hasattr(submission, 'gallery_data'):
-        gallery_data = submission.gallery_data
-        if not gallery_data:
-            logger.error(f"Empty gallery data for post {submission.id}")
-            return media_list
-        for item in gallery_data.get('items', []):
-            media_id = item.get('media_id')
-            if not media_id:
-                logger.warning(f"Missing media_id in gallery item for {submission.id}")
-                continue
-            meta = submission.media_metadata.get(media_id)
-            if not meta:
-                logger.warning(f"Missing metadata for media_id {media_id} in {submission.id}")
-                continue
+    if getattr(submission, 'is_gallery', False):
+        for key, meta in submission.media_metadata.items():
+            if meta['e'] == 'Image':
+                url = meta['s']['u'].replace("&amp;", "&")
+                media_list.append({"url": url, "type": "photo"})
 
-            media_type = 'photo'
-            s_data = meta.get('s')
-            media_e = meta.get('e')
-            if not s_data:
-                logger.error(f"Missing 's' data in metadata for {media_id} in {submission.id}")
-                continue
-            media_url = s_data.get('u')
-            if media_e == 'RedditVideo':
-                media_type = 'video'
-            elif media_e == 'AnimatedImage':
-                media_type = 'gif'
-                media_url = s_data.get('gif')
-                if not media_url:
-                    logger.error(f"Missing 'gif' URL in AnimatedImage metadata for {media_id}")
-                    continue
-            else:
-                if media_e and media_e != 'photo':
-                    logger.warning(f"Unknown media type '{media_e}' for {media_id} - defaulting to photo")
-            
-            if not media_url:
-                logger.error(f"Missing media URL for {media_id} in {submission.id}")
-                continue
-            media_list.append((media_url, media_type))
-    # Direct image
-    elif re.match(r'^https://(i.redd.it|preview.redd.it)/.*\.(jpg|jpeg|png)$', url):
-        media_list.append((url, 'photo'))
-    
+    # Reddit video
+    elif hasattr(submission, 'media') and submission.media and 'reddit_video' in submission.media:
+        media_url = submission.media['reddit_video']['fallback_url']
+        media_list.append({"url": media_url, "type": "video"})
+
+    # Direct image/video links
+    elif submission.url.endswith((".jpg", ".jpeg", ".png")):
+        media_list.append({"url": submission.url, "type": "photo"})
+    elif submission.url.endswith((".gif", ".mp4")):
+        media_type = "gif" if submission.url.endswith(".gif") else "video"
+        media_list.append({"url": submission.url, "type": media_type})
+
+    # External hosts
+    else:
+        host_url = submission.url.lower()
+        if "imgur.com" in host_url:
+            if host_url.endswith((".jpg", ".png", ".gif")):
+                media_list.append({"url": submission.url, "type": "photo"})
+            elif "/a/" in host_url or "/gallery/" in host_url:
+                logging.info("Imgur album detected; skipping: %s", submission.url)
+        elif "gfycat.com" in host_url or "redgifs.com" in host_url:
+            media_list.append({"url": submission.url, "type": "video"})
+
     return media_list
 
-async def download_media(reddit, url, post_link):
-    """Non-blocking media download using threads."""
-    if "redd.it" in url:
-        try:
-            def reddit_download():
-                response = reddit.session.get(url, stream=True)
-                response.raise_for_status()
-                return response.raw.read()
-            return await asyncio.to_thread(reddit_download)
-        except Exception as e:
-            logger.error(f"Reddit media download failed ({url}): {e}")
-            return None
-    else:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Referer': post_link
-        }
-        try:
-            response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
-            response.raise_for_status()
-            return response.content
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Media download failed ({url}): {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected download error ({url}): {e}")
-            return None
+# ---------- UTILS ----------
+def prepare_caption(submission: Submission):
+    return f"<b>{submission.title}</b>\nPosted by u/{submission.author}\n<a href='{submission.url}'>Reddit Link</a>"
 
-async def send_error_to_telegram(bot, chat_id, topic_id, error_message):
-    """Sends error messages to Telegram."""
+def download_media(url):
+    resp = requests.get(url)
+    resp.raise_for_status()
+    return BytesIO(resp.content)
+
+def send_media(submission: Submission, media_list, telegram_group_id):
+    """Send media to the specified Telegram group/topic"""
     try:
-        await bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=topic_id,
-            text=f"<b>Error</b>: <code>{error_message}</code>",
-            parse_mode=ParseMode.HTML
-        )
-    except Exception as e:
-        logger.error(f"Failed to send error message: {e}")
-
-async def send_to_telegram(bot, reddit, chat_id, topic_id, submission, media_list, error_topic_id):
-    """Sends post to Telegram with media handling, returns success status."""
-    title = escape_html_text(submission.title)
-    author = escape_html_text(str(submission.author))
-    post_link = f"https://reddit.com{submission.permalink}"
-    comments_text = get_top_comments(submission)
-
-    caption = (
-        f"<b>New Post from r/{submission.subreddit.display_name}</b>\n"
-        f"<b>Title</b>: {title}\n"
-        f"<b>Author</b>: u/{author}\n\n"
-        f"<b>Link</b>: <a href='{post_link}'>View Post</a>\n\n"
-    )
-    if comments_text:
-        caption += f"<b>Top Comments:</b>\n{comments_text}"
-
-    if len(media_list) > 10:
-        await send_error_to_telegram(bot, chat_id, error_topic_id, 
-                                    f"Too many media items ({len(media_list)}) for post {submission.id}")
-        logger.warning(f"Media limit exceeded for {submission.id}")
-        return False
-
-    try:
-        if not media_list:
-            logger.info(f"Skipped post {submission.id} (no media)")
-            return False
-
-        # Download media content first to check for failures
-        media_content = []
-        for url, _ in media_list:
-            content = await download_media(reddit, url, post_link)
-            if not content:
-                await send_error_to_telegram(bot, chat_id, error_topic_id, 
-                                            f"Failed to download media for post {submission.id} (URL: {url})")
-                return False
-            media_content.append(content)
-
-        # Prepare media group or single media
+        caption = prepare_caption(submission)
         if len(media_list) > 1:
-            media_group = []
-            for i, (url, media_type) in enumerate(media_list):
-                content = media_content[i]
-                if media_type == 'video':
-                    media = InputMediaVideo(content, caption=caption if i == 0 else "", parse_mode=ParseMode.HTML)
-                else:
-                    media = InputMediaPhoto(content, caption=caption if i == 0 else "", parse_mode=ParseMode.HTML)
-                media_group.append(media)
-            await bot.send_media_group(chat_id=chat_id, media=media_group, message_thread_id=topic_id)
+            tg_media = []
+            for media in media_list:
+                bio = download_media(media["url"])
+                if media["type"] == "photo":
+                    tg_media.append(InputMediaPhoto(media=bio))
+                elif media["type"] in ["video", "gif"]:
+                    tg_media.append(InputMediaVideo(media=bio))
+            bot.send_media_group(chat_id=telegram_group_id, media=tg_media)
         else:
-            url, media_type = media_list[0]
-            content = media_content[0]
-            if media_type == 'video':
-                await bot.send_video(chat_id=chat_id, video=content, caption=caption, parse_mode=ParseMode.HTML, message_thread_id=topic_id)
-            elif media_type == 'gif':
-                await bot.send_animation(chat_id=chat_id, animation=content, caption=caption, parse_mode=ParseMode.HTML, message_thread_id=topic_id)
-            else:
-                await bot.send_photo(chat_id=chat_id, photo=content, caption=caption, parse_mode=ParseMode.HTML, message_thread_id=topic_id)
-        logger.info(f"Successfully sent post {submission.id}")
-        return True
-    except telegram.error.TelegramError as e:
-        logger.error(f"Telegram API Error for {submission.id}: {e}")
-        await send_error_to_telegram(bot, chat_id, error_topic_id, f"Telegram API error: {str(e)}")
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected error for {submission.id}: {e}", exc_info=True)
-        await send_error_to_telegram(bot, chat_id, error_topic_id, f"Unexpected error: {str(e)}")
-        return False
+            media = media_list[0]
+            bio = download_media(media["url"])
+            if media["type"] == "photo":
+                bot.send_photo(chat_id=telegram_group_id, photo=bio, caption=caption, parse_mode=ParseMode.HTML)
+            elif media["type"] == "video":
+                bot.send_video(chat_id=telegram_group_id, video=bio, caption=caption, parse_mode=ParseMode.HTML)
+            elif media["type"] == "gif":
+                bot.send_animation(chat_id=telegram_group_id, animation=bio, caption=caption, parse_mode=ParseMode.HTML)
+        logging.info(f"Post sent: {submission.title} to {telegram_group_id}")
+    except TelegramError as e:
+        logging.error(f"Error sending post: {submission.title} - {e}")
+        bot.send_message(chat_id=telegram_error_topic_id, text=f"Error sending post: {submission.title}\n{e}")
 
-# --- Persistence ---
-def load_processed_posts():
-    """Loads processed post IDs from file."""
-    processed_posts = set()
-    try:
-        with open("processed_posts.db", "r") as f:
-            for line in f:
-                pid = line.strip()
-                if pid:
-                    processed_posts.add(pid)
-        logger.info(f"Loaded {len(processed_posts)} processed posts.")
-    except FileNotFoundError:
-        logger.info("Processed posts file not found - starting with empty set.")
-    except Exception as e:
-        logger.error(f"Error loading processed_posts.db: {e}")
-    return processed_posts
-
-async def save_processed_posts(context):
-    """Saves processed post IDs to file."""
-    processed_posts = context.application.bot_data.get('processed_posts', set())
-    try:
-        with open("processed_posts.db", "w") as f:
-            for pid in processed_posts:
-                f.write(f"{pid}\n")
-        logger.info(f"Saved {len(processed_posts)} processed posts.")
-    except Exception as e:
-        logger.error(f"Error saving processed_posts.db: {e}")
-
-# --- Error Handling ---
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles errors during update processing."""
-    error = context.error
-    logger.error(f"Error handling update {update}: {error}", exc_info=True)
-    error_topic_id = context.application.bot_data.get('telegram_error_topic_id')
-    if error_topic_id and update and update.effective_chat:
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                message_thread_id=error_topic_id,
-                text=f"Error occurred: {str(error)}",
-                parse_mode=ParseMode.HTML
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify error topic: {e}")
-
-# --- Command Handlers ---
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "I forward new media posts from Reddit to Telegram. "
-        "Configure subreddits with /add <subreddit> <topic_id>"
-    )
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    admin_id = context.application.bot_data.get('admin_id')
-    user_id = update.effective_user.id
-    if admin_id is None or user_id != admin_id:
-        await update.message.reply_text("You are not authorized to use this command.")
-        return
-    start_time = context.application.bot_data.get('start_time', time.time())
-    uptime_seconds = time.time() - start_time
-    days, remainder = divmod(uptime_seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    uptime_str = f"{int(days)}d {int(hours)}h {int(minutes)}m {int(seconds):.0f}s"
-    await update.message.reply_text(f"The bot has been running for: {uptime_str}")
-
-async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat.is_forum:
-        await update.message.reply_text("This command must be used in a Telegram group with topics enabled.")
-        return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Usage: /add <subreddit_name> <topic_id>")
-        return
-    subreddit_name, topic_id_str = args
-    try:
-        topic_id = int(topic_id_str)
-        if topic_id <= 0:
-            raise ValueError("Topic ID must be a positive integer.")
-    except ValueError:
-        await update.message.reply_text("Invalid Topic ID. Please provide a valid positive integer.")
-        return
-
-    reddit = context.application.bot_data.get('reddit')
-    if not reddit:
-        await update.message.reply_text("Reddit client not initialized.")
-        return
-
-    # Verify subreddit exists
-    try:
-        await asyncio.to_thread(reddit.subreddit(subreddit_name).about)
-    except Exception as e:
-        logger.error(f"Subreddit check failed for {subreddit_name}: {e}")
-        await update.message.reply_text(f"Subreddit r/{subreddit_name} does not exist or is inaccessible.")
-        return
-
-    # Check for existing entry
-    subreddit_lower = subreddit_name.lower()
-    existing_subreddits = set()
-    try:
-        with open("subreddits.db", "r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    sub = line.split(',', 1)[0].strip().lower()
-                    existing_subreddits.add(sub)
-        if subreddit_lower in existing_subreddits:
-            await update.message.reply_text(f"r/{subreddit_name} is already in the watchlist.")
-            return
-    except Exception as e:
-        logger.error(f"Error checking subreddits.db: {e}")
-        await update.message.reply_text("An error occurred while checking the watchlist.")
-        return
-
-    # Add to config file
-    try:
-        with open("subreddits.db", "a") as f:
-            f.write(f"\n{subreddit_lower},{topic_id}")
-        await update.message.reply_text(f"Added r/{subreddit_name} to the watchlist. Stream will reload.")
-        context.application.bot_data['restart_flag'] = True
-    except Exception as e:
-        logger.error(f"Error writing to subreddits.db: {e}")
-        await update.message.reply_text("Failed to add subreddit to watchlist.")
-
-async def comments_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    post_link = None
-    if context.args:
-        post_link = context.args[0]
-    elif update.message.reply_to_message:
-        text = update.message.reply_to_message.text
-        if not text:
-            await update.message.reply_text("Replied message has no text.")
-            return
-        match_reddit = re.search(r'https?://(?:www\.)?reddit\.com/r/[^/]+/comments/([^/]+)/', text)
-        match_redd_it = re.search(r'https?://redd\.it/([^/]+)', text)
-        if match_reddit:
-            post_id = match_reddit.group(1)
-            subreddit_name = text.split('/r/')[-1].split('/')[0]
-            post_link = f"https://reddit.com/r/{subreddit_name}/comments/{post_id}"
-        elif match_redd_it:
-            post_id = match_redd_it.group(1)
-            post_link = f"https://reddit.com/comments/{post_id}"
-    
-    if not post_link:
-        await update.message.reply_text("Please provide a Reddit post link or reply to a message containing one.")
-        return
-
-    try:
-        reddit = context.application.bot_data['reddit']
-        submission = await asyncio.to_thread(reddit.submission, url=post_link)
-        comments_text = get_top_comments(submission)
-        if comments_text:
-            await update.message.reply_text(
-                f"<b>Top Comments for r/{submission.subreddit.display_name}</b>:\n\n{comments_text}",
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True
-            )
-        else:
-            await update.message.reply_text("No comments found for this post.")
-    except Exception as e:
-        logger.error(f"Comments retrieval error: {e}")
-        await update.message.reply_text("An error occurred while fetching comments.")
-
-async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Re-sends a specified Reddit post to the Telegram group for debugging (with topic validation)."""
-    if not update.effective_chat.is_forum:
-        await update.message.reply_text("This command must be used in a Telegram group with topics enabled.")
-        return
-
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Please reply to a message containing a Reddit post link to use this command.")
-        return
-
-    text = update.message.reply_to_message.text
-    if text is None:
-        await update.message.reply_text("The replied message does not contain text.")
-        return
-
-    match = re.search(r'https?://(?:www\.)?(?:reddit\.com/r/[^/]+/comments/|redd\.it/)([^/]+)', text)
-    if not match:
-        await update.message.reply_text("Could not find a Reddit post link in the replied message.")
-        return
-    submission_id = match.group(1)
-
-    try:
-        await update.message.reply_text(f"Reloading post with ID: {submission_id}...", 
-                                      reply_to_message_id=update.message.message_id)
-        reddit = context.application.bot_data['reddit']
-        submission = await asyncio.to_thread(reddit.submission, id=submission_id)
-        media_list = get_media_urls(submission)
-        if not media_list:
-            await update.message.reply_text("This post does not contain supported media.")
-            return
-        
-        processed_posts = context.application.bot_data.get('processed_posts', set())
-        processed_posts_lock = context.application.bot_data.get('processed_posts_lock', asyncio.Lock())
-        async with processed_posts_lock:
-            if submission.id in processed_posts:
-                await update.message.reply_text("This post has already been processed.")
-                return
-        
-        send_success = await send_to_telegram(
-            context.bot,
-            reddit,
-            update.effective_chat.id,
-            update.message.message_thread_id,
-            submission,
-            media_list,
-            context.application.bot_data.get('telegram_error_topic_id', update.effective_chat.id)
-        )
-        
-        if send_success:
-            async with processed_posts_lock:
-                processed_posts.add(submission.id)
-            await save_processed_posts(context)
-            await update.message.reply_text("Post reloaded successfully!", 
-                                          reply_to_message_id=update.message.message_id)
-            logger.info(f"Successfully reloaded post {submission.id}")
-        else:
-            await update.message.reply_text("Failed to reload post.", 
-                                          reply_to_message_id=update.message.message_id)
-    except Exception as e:
-        logger.error(f"Reload error for post {submission_id}: {e}", exc_info=True)
-        await update.message.reply_text("An error occurred while trying to reload the post.", 
-                                      reply_to_message_id=update.message.message_id)
-
-async def handle_reddit_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles messages with a Reddit post link and sends the post (with topic validation and proper ID check)."""
-    if not update.effective_chat.is_forum:
-        await update.message.reply_text("This command must be used in a Telegram group with topics enabled.")
-        return
-
-    text = update.message.text
-    if not text:
-        await update.message.reply_text("Message contains no text.")
-        return
-
-    match = re.search(r'https?://(?:www\.)?(?:reddit\.com/r/[^/]+/comments/|redd\.it/)([^/]+)', text)
-    if not match:
-        return
-    
-    submission_id = match.group(1)
-    try:
-        processed_posts = context.application.bot_data.get('processed_posts', set())
-        processed_posts_lock = context.application.bot_data.get('processed_posts_lock', asyncio.Lock())
-        async with processed_posts_lock:
-            if submission_id in processed_posts:
-                await update.message.reply_text("This post has already been sent.")
-                return
-        
-        reddit = context.application.bot_data['reddit']
-        submission = await asyncio.to_thread(reddit.submission, id=submission_id)
-        media_list = get_media_urls(submission)
-        if not media_list:
-            await update.message.reply_text("This post does not contain supported media.")
-            return
-        
-        await update.message.reply_text("Sending post to the group...", reply_to_message_id=update.message.message_id)
-        send_success = await send_to_telegram(
-            context.bot,
-            reddit,
-            update.effective_chat.id,
-            update.message.message_thread_id,
-            submission,
-            media_list,
-            context.application.bot_data.get('telegram_error_topic_id', update.effective_chat.id)
-        )
-        
-        if send_success:
-            async with processed_posts_lock:
-                processed_posts.add(submission_id)
-            await save_processed_posts(context)
-            await update.message.reply_text("Post sent!", reply_to_message_id=update.message.message_id)
-            logger.info(f"Successfully sent post {submission_id}")
-        else:
-            await update.message.reply_text("Failed to send post.", reply_to_message_id=update.message.message_id)
-    except Exception as e:
-        logger.error(f"Link processing error for {submission_id}: {e}", exc_info=True)
-        await update.message.reply_text("An error occurred while trying to send the post.")
-
-# --- Stream Function ---
-async def stream_submissions(context: ContextTypes.DEFAULT_TYPE):
-    """Monitors Reddit for new submissions and sends them to Telegram (with restart logic)."""
-    reddit = context.application.bot_data.get('reddit')
-    bot = context.application.bot
-    subreddits_config = context.application.bot_data.get('subreddits_config', {})
-    group_id = context.application.bot_data.get('telegram_group_id')
-    error_topic_id = context.application.bot_data.get('telegram_error_topic_id', group_id)
-    processed_posts = context.application.bot_data.get('processed_posts', set())
-    processed_posts_lock = context.application.bot_data.get('processed_posts_lock', asyncio.Lock())
-
-    if not reddit or not bot or not group_id:
-        logger.error("Missing Reddit/Telegram configuration in bot data.")
-        return
-
+# ---------- MAIN LOOP ----------
+def main():
+    subreddit_map = load_subreddits_mapping(subreddits_db_path)
+    logging.info("Bot started, monitoring subreddits: %s", ", ".join(subreddit_map.keys()))
     while True:
-        if context.application.bot_data.get('restart_flag'):
-            context.application.bot_data['restart_flag'] = False
-            logger.info("Reloading subreddits configuration...")
-            try:
-                new_subreddits_config = {}
-                with open("subreddits.db", "r") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#'):
-                            parts = line.split(',', 1)
-                            if len(parts) != 2:
-                                logger.warning(f"Invalid line in subreddits.db: {line}")
-                                continue
-                            sub = parts[0].strip().lower()
-                            tid_str = parts[1].strip()
-                            try:
-                                tid = int(tid_str)
-                                new_subreddits_config[sub] = tid
-                            except ValueError:
-                                logger.warning(f"Invalid Topic ID in line '{line}' (must be integer)")
-                context.application.bot_data['subreddits_config'] = new_subreddits_config
-                subreddits_config = new_subreddits_config
-                logger.info(f"Reloaded {len(subreddits_config)} subreddits.")
-            except Exception as e:
-                logger.error(f"Error reloading subreddits.db: {e}")
-            await asyncio.sleep(5)
-            continue
-
-        if not subreddits_config:
-            logger.info("No subreddits configured. Pausing stream...")
-            await asyncio.sleep(30)
-            continue
-
-        subreddit_names = '+'.join(subreddits_config.keys())
-        logger.info(f"Monitoring subreddits: {subreddit_names}")
-
         try:
-            subreddit_stream = reddit.subreddit(subreddit_names).stream.submissions(skip_existing=True)
-            
-            for submission in subreddit_stream:  # Regular for loop (not async)
-                subreddit_lower = submission.subreddit.display_name.lower()
-                if subreddit_lower not in subreddits_config:
-                    continue
-                
-                topic_id = subreddits_config[subreddit_lower]
-                submission_id = submission.id
-
-                async with processed_posts_lock:
-                    if submission_id in processed_posts:
-                        logger.info(f"Skipping processed post {submission_id}")
-                        continue
-
+            for submission in reddit.subreddit("+".join(subreddit_map.keys())).stream.submissions(skip_existing=True):
                 media_list = get_media_urls(submission)
                 if not media_list:
-                    logger.info(f"Skipping post {submission_id}: No supported media")
+                    logging.info(f"No supported media in post: {submission.title}")
                     continue
-
-                try:
-                    logger.info(f"Processing new post {submission_id} from r/{subreddit_lower}")
-                    send_success = await send_to_telegram(
-                        bot,
-                        reddit,
-                        group_id,
-                        topic_id,
-                        submission,
-                        media_list,
-                        error_topic_id
-                    )
-                    if send_success:
-                        async with processed_posts_lock:
-                            processed_posts.add(submission_id)
-                        await save_processed_posts(context)
-                        logger.info(f"Successfully sent post {submission_id}")
-                except Exception as e:
-                    logger.error(f"Error sending post {submission_id}: {e}", exc_info=True)
-                
-                await asyncio.sleep(0.2)
+                telegram_group_id = subreddit_map.get(submission.subreddit.display_name)
+                if telegram_group_id:
+                    send_media(submission, media_list, telegram_group_id)
+                else:
+                    logging.warning(f"No Telegram group configured for subreddit {submission.subreddit.display_name}")
         except Exception as e:
-            logger.error(f"Stream error: {e}. Restarting stream in 10 seconds...")
-            await asyncio.sleep(10)
-
-# --- Main Function ---
-def main() -> None:
-    load_dotenv()
-
-    required_vars = [
-        ('REDDIT_CLIENT_ID', str),
-        ('REDDIT_CLIENT_SECRET', str),
-        ('REDDIT_USERNAME', str),
-        ('REDDIT_PASSWORD', str),
-        ('TELEGRAM_BOT_TOKEN', str),
-        ('TELEGRAM_GROUP_ID', int),
-        ('TELEGRAM_ADMIN_ID', int),
-        ('TELEGRAM_ERROR_TOPIC_ID', int)
-    ]
-    env = {}
-    for name, typ in required_vars:
-        val = os.getenv(name)
-        if val is None:
-            logger.error(f"Missing required environment variable: {name}")
-            sys.exit(1)
-        if typ == int:
-            try:
-                env[name] = int(val)
-            except ValueError:
-                logger.error(f"Invalid {name}: must be an integer.")
-                sys.exit(1)
-        else:
-            env[name] = val.strip()
-
-    # Initialize Reddit
-    try:
-        reddit = praw.Reddit(
-            client_id=env['REDDIT_CLIENT_ID'],
-            client_secret=env['REDDIT_CLIENT_SECRET'],
-            username=env['REDDIT_USERNAME'],
-            password=env['REDDIT_PASSWORD'],
-            user_agent="Reddit to Telegram Bot/1.0"
-        )
-        asyncio.run(asyncio.to_thread(reddit.user.me))
-        logger.info("Successfully connected to Reddit.")
-    except Exception as e:
-        logger.error(f"Failed to connect to Reddit: {e}")
-        sys.exit(1)
-
-    # Initialize Telegram
-    try:
-        application = Application.builder().token(env['TELEGRAM_BOT_TOKEN']).build()
-        logger.info("Successfully connected to Telegram.")
-    except Exception as e:
-        logger.error(f"Failed to connect to Telegram: {e}")
-        sys.exit(1)
-
-    # Load bot data
-    logger.info("Starting bot.")
-    
-    # Load subreddits config
-    try:
-        subreddits_config = {}
-        with open("subreddits.db", "r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    parts = line.split(',', 1)
-                    if len(parts) != 2:
-                        logger.warning(f"Invalid line in subreddits.db: {line}")
-                        continue
-                    sub = parts[0].strip().lower()
-                    tid_str = parts[1].strip()
-                    try:
-                        tid = int(tid_str)
-                        subreddits_config[sub] = tid
-                    except ValueError:
-                        logger.warning(f"Invalid Topic ID in line '{line}' (must be integer)")
-        logger.info(f"Loaded {len(subreddits_config)} subreddits from configuration.")
-    except FileNotFoundError:
-        with open("subreddits.db", "w") as f:
-            f.write("# Format: subreddit,topic_id\n")
-        subreddits_config = {}
-        logger.warning("subreddits.db not found - created new file.")
-    except Exception as e:
-        logger.error(f"Error loading subreddits.db: {e}")
-        sys.exit(1)
-
-    # Load processed posts
-    processed_posts = load_processed_posts()
-    processed_posts_lock = asyncio.Lock()
-
-    # Store bot data
-    application.bot_data.update({
-        'reddit': reddit,
-        'subreddits_config': subreddits_config,
-        'telegram_group_id': env['TELEGRAM_GROUP_ID'],
-        'telegram_error_topic_id': env['TELEGRAM_ERROR_TOPIC_ID'],
-        'admin_id': env['TELEGRAM_ADMIN_ID'],
-        'processed_posts': processed_posts,
-        'processed_posts_lock': processed_posts_lock,
-        'start_time': time.time(),
-        'restart_flag': False
-    })
-
-    # Register handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("admin", admin_command))
-    application.add_handler(CommandHandler("add", add_command))
-    application.add_handler(CommandHandler("comments", comments_command))
-    application.add_handler(CommandHandler("reload", reload_command))
-
-    link_regex = r'https?://(?:www\.)?(?:reddit\.com/r/[^/]+/comments/|redd\.it/)([^/]+)'
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(link_regex), handle_reddit_link))
-
-    # Register error handler
-    application.add_error_handler(error_handler)
-
-    # Start streaming job
-    application.job_queue.run_once(stream_submissions, 1)
-
-    # Run bot
-    try:
-        application.run_polling()
-    finally:
-        asyncio.run(save_processed_posts(context=ContextTypes.DEFAULT_TYPE()))
-        logger.info("Bot stopped - saved processed posts.")
+            logging.error(f"Stream error: {e}. Restarting in 10 seconds...")
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()
