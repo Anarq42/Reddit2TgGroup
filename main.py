@@ -8,6 +8,7 @@ from telegram.error import TelegramError
 from telegram.constants import ParseMode
 from praw import Reddit
 from praw.models import Submission
+from bs4 import BeautifulSoup
 
 # ---------- CREDENTIALS ----------
 reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
@@ -36,11 +37,6 @@ reddit = Reddit(
 
 # ---------- LOAD SUBREDDITS ----------
 def load_subreddits_mapping(file_path):
-    """
-    Returns a dict: {subreddit_name: telegram_group_id}
-    Expects a text file where each line is:
-    subreddit_name,telegram_group_id
-    """
     mapping = {}
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -84,7 +80,17 @@ def get_media_urls(submission: Submission):
             if host_url.endswith((".jpg", ".png", ".gif")):
                 media_list.append({"url": submission.url, "type": "photo"})
             elif "/a/" in host_url or "/gallery/" in host_url:
-                logging.info("Imgur album detected; skipping: %s", submission.url)
+                # Scrape album images
+                try:
+                    resp = requests.get(submission.url)
+                    soup = BeautifulSoup(resp.text, "lxml")
+                    images = [img['src'] for img in soup.find_all('img') if 'i.imgur.com' in img['src']]
+                    for img_url in images:
+                        if img_url.startswith("//"):
+                            img_url = "https:" + img_url
+                        media_list.append({"url": img_url, "type": "photo"})
+                except Exception as e:
+                    logging.warning("Failed to parse Imgur album: %s", submission.url)
         elif "gfycat.com" in host_url or "redgifs.com" in host_url:
             media_list.append({"url": submission.url, "type": "video"})
 
@@ -100,27 +106,32 @@ def download_media(url):
     return BytesIO(resp.content)
 
 def send_media(submission: Submission, media_list, telegram_group_id):
-    """Send media to the specified Telegram group/topic"""
+    """Send media or fallback Reddit link"""
     try:
         caption = prepare_caption(submission)
-        if len(media_list) > 1:
-            tg_media = []
-            for media in media_list:
+        if media_list:
+            if len(media_list) > 1:
+                tg_media = []
+                for media in media_list:
+                    bio = download_media(media["url"])
+                    if media["type"] == "photo":
+                        tg_media.append(InputMediaPhoto(media=bio))
+                    elif media["type"] in ["video", "gif"]:
+                        tg_media.append(InputMediaVideo(media=bio))
+                bot.send_media_group(chat_id=telegram_group_id, media=tg_media)
+            else:
+                media = media_list[0]
                 bio = download_media(media["url"])
                 if media["type"] == "photo":
-                    tg_media.append(InputMediaPhoto(media=bio))
-                elif media["type"] in ["video", "gif"]:
-                    tg_media.append(InputMediaVideo(media=bio))
-            bot.send_media_group(chat_id=telegram_group_id, media=tg_media)
+                    bot.send_photo(chat_id=telegram_group_id, photo=bio, caption=caption, parse_mode=ParseMode.HTML)
+                elif media["type"] == "video":
+                    bot.send_video(chat_id=telegram_group_id, video=bio, caption=caption, parse_mode=ParseMode.HTML)
+                elif media["type"] == "gif":
+                    bot.send_animation(chat_id=telegram_group_id, animation=bio, caption=caption, parse_mode=ParseMode.HTML)
         else:
-            media = media_list[0]
-            bio = download_media(media["url"])
-            if media["type"] == "photo":
-                bot.send_photo(chat_id=telegram_group_id, photo=bio, caption=caption, parse_mode=ParseMode.HTML)
-            elif media["type"] == "video":
-                bot.send_video(chat_id=telegram_group_id, video=bio, caption=caption, parse_mode=ParseMode.HTML)
-            elif media["type"] == "gif":
-                bot.send_animation(chat_id=telegram_group_id, animation=bio, caption=caption, parse_mode=ParseMode.HTML)
+            # No media, just send Reddit link
+            bot.send_message(chat_id=telegram_group_id, text=caption, parse_mode=ParseMode.HTML)
+
         logging.info(f"Post sent: {submission.title} to {telegram_group_id}")
     except TelegramError as e:
         logging.error(f"Error sending post: {submission.title} - {e}")
@@ -134,9 +145,6 @@ def main():
         try:
             for submission in reddit.subreddit("+".join(subreddit_map.keys())).stream.submissions(skip_existing=True):
                 media_list = get_media_urls(submission)
-                if not media_list:
-                    logging.info(f"No supported media in post: {submission.title}")
-                    continue
                 telegram_group_id = subreddit_map.get(submission.subreddit.display_name)
                 if telegram_group_id:
                     send_media(submission, media_list, telegram_group_id)
