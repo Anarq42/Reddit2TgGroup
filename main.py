@@ -16,7 +16,8 @@ reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET")
 reddit_username = os.getenv("REDDIT_USERNAME")
 reddit_password = os.getenv("REDDIT_PASSWORD")
 telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
-telegram_error_topic_id = os.getenv("TELEGRAM_ERROR_TOPIC_ID")
+telegram_group_id = int(os.getenv("TELEGRAM_GROUP_ID"))  # Main group ID
+telegram_error_topic_id = int(os.getenv("TELEGRAM_ERROR_TOPIC_ID"))  # Fallback topic
 subreddits_db_path = "subreddits.db"
 
 # ---------- LOGGING ----------
@@ -46,8 +47,8 @@ def load_subreddits_mapping(file_path):
             parts = line.split(",")
             if len(parts) != 2:
                 continue
-            subreddit_name, group_id = parts
-            mapping[subreddit_name.strip()] = group_id.strip()
+            subreddit_name, topic_id = parts
+            mapping[subreddit_name.strip()] = int(topic_id.strip())
     return mapping
 
 # ---------- MEDIA HANDLING ----------
@@ -107,7 +108,7 @@ async def get_media_urls(submission: Submission):
 def prepare_caption(submission: Submission):
     return f"<b>{submission.title}</b>\nPosted by u/{submission.author}\n<a href='{submission.url}'>Reddit Link</a>"
 
-async def send_media(submission: Submission, media_list, telegram_group_id):
+async def send_media(submission: Submission, media_list, topic_id):
     """Send media or fallback Reddit link"""
     caption = prepare_caption(submission)
     try:
@@ -121,24 +122,30 @@ async def send_media(submission: Submission, media_list, telegram_group_id):
                             tg_media.append(InputMediaPhoto(media=bio))
                         elif media["type"] in ["video", "gif"]:
                             tg_media.append(InputMediaVideo(media=bio))
-                await bot.send_media_group(chat_id=telegram_group_id, media=tg_media)
+                await bot.send_media_group(chat_id=telegram_group_id, message_thread_id=topic_id, media=tg_media)
             else:
                 media = media_list[0]
                 async with aiohttp.ClientSession() as session:
                     bio = await fetch_bytes(session, media["url"])
                 if media["type"] == "photo":
-                    await bot.send_photo(chat_id=telegram_group_id, photo=bio, caption=caption, parse_mode=ParseMode.HTML)
+                    await bot.send_photo(chat_id=telegram_group_id, message_thread_id=topic_id,
+                                         photo=bio, caption=caption, parse_mode=ParseMode.HTML)
                 elif media["type"] == "video":
-                    await bot.send_video(chat_id=telegram_group_id, video=bio, caption=caption, parse_mode=ParseMode.HTML)
+                    await bot.send_video(chat_id=telegram_group_id, message_thread_id=topic_id,
+                                         video=bio, caption=caption, parse_mode=ParseMode.HTML)
                 elif media["type"] == "gif":
-                    await bot.send_animation(chat_id=telegram_group_id, animation=bio, caption=caption, parse_mode=ParseMode.HTML)
+                    await bot.send_animation(chat_id=telegram_group_id, message_thread_id=topic_id,
+                                             animation=bio, caption=caption, parse_mode=ParseMode.HTML)
         else:
-            await bot.send_message(chat_id=telegram_group_id, text=caption, parse_mode=ParseMode.HTML)
+            # No media, just send Reddit link
+            await bot.send_message(chat_id=telegram_group_id, message_thread_id=topic_id,
+                                   text=caption, parse_mode=ParseMode.HTML)
 
-        logging.info(f"Post sent: {submission.title} to {telegram_group_id}")
+        logging.info(f"Post sent: {submission.title} to topic {topic_id}")
     except TelegramError as e:
         logging.error(f"Error sending post: {submission.title} - {e}")
-        await bot.send_message(chat_id=telegram_error_topic_id, text=f"Error sending post: {submission.title}\n{e}")
+        await bot.send_message(chat_id=telegram_error_topic_id,
+                               text=f"Error sending post: {submission.title}\n{e}")
 
 # ---------- MAIN LOOP ----------
 async def main():
@@ -148,11 +155,8 @@ async def main():
         try:
             for submission in reddit.subreddit("+".join(subreddit_map.keys())).stream.submissions(skip_existing=True):
                 media_list = await get_media_urls(submission)
-                telegram_group_id = subreddit_map.get(submission.subreddit.display_name)
-                if telegram_group_id:
-                    await send_media(submission, media_list, telegram_group_id)
-                else:
-                    logging.warning(f"No Telegram group configured for subreddit {submission.subreddit.display_name}")
+                topic_id = subreddit_map.get(submission.subreddit.display_name, telegram_error_topic_id)
+                await send_media(submission, media_list, topic_id)
         except Exception as e:
             logging.error(f"Stream error: {e}. Restarting in 10 seconds...")
             await asyncio.sleep(10)
