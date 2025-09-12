@@ -7,3 +7,4 @@ aiohttp
 pillow
 imageio[ffmpeg]
 moviepy
+asyncpraw
