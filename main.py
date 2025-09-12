@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 -1
 import os
 import logging
 import asyncio
@@ -17,13 +17,13 @@ from telegram.error import TelegramError, BadRequest
 import asyncpraw
 from bs4 import BeautifulSoup
 
-# ---------- LOGGING ----------
+# ---------- LOGGING ---------- -2
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# ---------- ENV VARS ----------
+# ---------- ENV VARS ---------- -3
 def get_env_var(name: str, cast=str):
     val = os.getenv(name)
     if val is None:
@@ -44,7 +44,7 @@ REDDIT_PASSWORD = get_env_var("REDDIT_PASSWORD")
 SUBREDDITS_DB_PATH = "subreddits.db"
 POSTED_IDS_PATH = "posted_ids.json"  # For tracking duplicates
 
-# ---------- LOAD SUBREDDITS ----------
+# ---------- LOAD SUBREDDITS ---------- -4
 def load_subreddits_mapping(file_path):
     mapping = {}
     try:
@@ -64,7 +64,7 @@ def load_subreddits_mapping(file_path):
 
 subreddit_map = load_subreddits_mapping(SUBREDDITS_DB_PATH)
 
-# ---------- TRACK POSTED IDS ----------
+# ---------- TRACK POSTED IDS ---------- -5
 def load_posted_ids():
     try:
         with open(POSTED_IDS_PATH, "r") as f:
@@ -89,13 +89,19 @@ def save_posted_ids(posted_ids):
 posted_ids = load_posted_ids()
 # We'll create an asyncio.Lock on startup and store in application.bot_data to avoid loop/multithread issues.
 
-# ---------- UTILITIES ----------
+# ---------- UTILITIES ---------- -6
 def prepare_caption(submission):
     author = submission.author.name if getattr(submission, "author", None) else "[deleted]"
     safe_title = html.escape(getattr(submission, "title", ""))
     safe_author = html.escape(author)
     safe_url = html.escape(getattr(submission, "url", ""))
-    return f"<b>{safe_title}</b>\nPosted by u/{safe_author}\n<a href='{safe_url}'>Reddit Link</a>"
+    safe_subreddit = html.escape(submission.subreddit.display_name)
+
+    return (
+        f"<b>{safe_title}</b>\n"
+        f"Posted by u/{safe_author} in r/{safe_subreddit}\n"
+        f"<a href='{safe_url}'>Reddit Link</a>"
+    )
 
 async def fetch_bytes(session: aiohttp.ClientSession, url: str) -> Optional[BytesIO]:
     try:
@@ -110,7 +116,7 @@ async def fetch_bytes(session: aiohttp.ClientSession, url: str) -> Optional[Byte
         logging.warning(f"Failed to fetch {url}: {e}")
         return None
 
-# ---------- Gfycat/Redgifs MP4 ----------
+# ---------- Gfycat/Redgifs MP4 ---------- -7
 async def get_gfy_redgifs_mp4(url):
     try:
         timeout = aiohttp.ClientTimeout(total=30)
@@ -135,7 +141,7 @@ async def get_gfy_redgifs_mp4(url):
         logging.warning(f"Failed to get mp4 from {url}: {e}")
     return None
 
-# ---------- MEDIA HANDLING ----------
+# ---------- MEDIA HANDLING ---------- -8
 async def get_media_urls(submission):
     media_list = []
     try:
@@ -173,7 +179,7 @@ async def get_media_urls(submission):
         logging.warning(f"Failed to get media URLs for {getattr(submission, 'id', '?')}: {e}")
     return media_list
 
-# ---------- SAFE SEND helpers ----------
+# ---------- SAFE SEND helpers ---------- -9
 async def _safe_send(coro, fallback_coro=None):
     """
     Await the provided send coroutine. If a BadRequest due to closed topic occurs,
@@ -193,7 +199,7 @@ async def _safe_send(coro, fallback_coro=None):
                     raise
         raise
 
-# ---------- SEND MEDIA ----------
+# ---------- SEND MEDIA ---------- -10
 async def send_media(submission, media_list, topic_id, bot):
     caption = prepare_caption(submission)
     timeout = aiohttp.ClientTimeout(total=60)
@@ -263,7 +269,7 @@ async def send_media(submission, media_list, topic_id, bot):
             logging.exception("Unexpected error while sending media")
             return False
 
-# ---------- PROCESS REDDIT LINK ----------
+# ---------- PROCESS REDDIT LINK ---------- -11
 async def send_reddit_link(url, bot, reddit_client, posted_ids_lock):
     try:
         # Use reddit.submission(url=...) (works with asyncpraw)
@@ -299,7 +305,7 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except BadRequest as e:
         logging.warning(f"Failed to send reply to user: {e}")
 
-# ---------- STREAM SUBREDDITS ----------
+# ---------- STREAM SUBREDDITS ---------- -12
 async def stream_subreddits(reddit_client, bot, posted_ids_lock):
     if not subreddit_map:
         logging.warning("No subreddits configured. Skipping stream.")
@@ -353,7 +359,7 @@ async def stream_subreddits(reddit_client, bot, posted_ids_lock):
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
-# ---------- STARTUP / SHUTDOWN HOOKS ----------
+# ---------- STARTUP / SHUTDOWN HOOKS ---------- -13
 async def _on_startup(context: ContextTypes.DEFAULT_TYPE):
     """
     This runs in the bot's event loop via the job queue. Create the reddit client
@@ -386,7 +392,7 @@ async def _on_shutdown(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logging.exception("Error closing reddit client")
 
-# ---------- MAIN (entrypoint) ----------
+# ---------- MAIN (entrypoint) ---------- -14
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("post", post_command))
