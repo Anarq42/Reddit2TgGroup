@@ -2,7 +2,6 @@ import os
 import logging
 import time
 import requests
-import sqlite3
 from io import BytesIO
 from telegram import Bot, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
 from telegram.error import TelegramError
@@ -36,19 +35,23 @@ reddit = Reddit(
 )
 
 # ---------- LOAD SUBREDDITS ----------
-def load_subreddits_mapping(db_path):
+def load_subreddits_mapping(file_path):
     """
     Returns a dict: {subreddit_name: telegram_group_id}
-    Assumes subreddits.db has table 'subreddits' with columns: name, telegram_group_id
+    Expects a text file where each line is:
+    subreddit_name,telegram_group_id
     """
     mapping = {}
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, telegram_group_id FROM subreddits")
-    for row in cursor.fetchall():
-        subreddit_name, group_id = row
-        mapping[subreddit_name.strip()] = group_id.strip()
-    conn.close()
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) != 2:
+                continue
+            subreddit_name, group_id = parts
+            mapping[subreddit_name.strip()] = group_id.strip()
     return mapping
 
 # ---------- MEDIA HANDLING ----------
