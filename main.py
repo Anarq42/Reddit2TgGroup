@@ -94,19 +94,6 @@ async def get_media_urls(submission: Submission):
         if "imgur.com" in host_url:
             if host_url.endswith((".jpg", ".png", ".gif")):
                 media_list.append({"url": submission.url, "type": "photo"})
-            elif "/a/" in host_url or "/gallery/" in host_url:
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(submission.url) as resp:
-                            text = await resp.text()
-                            soup = BeautifulSoup(text, "lxml")
-                            images = [img['src'] for img in soup.find_all('img') if 'i.imgur.com' in img['src']]
-                            for img_url in images:
-                                if img_url.startswith("//"):
-                                    img_url = "https:" + img_url
-                                media_list.append({"url": img_url, "type": "photo"})
-                except Exception as e:
-                    logging.warning("Failed to parse Imgur album: %s", submission.url)
         elif "gfycat.com" in host_url or "redgifs.com" in host_url:
             mp4_url = await get_gfy_redgifs_mp4(submission.url)
             if mp4_url:
@@ -200,6 +187,18 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await send_reddit_link(url)
     await update.message.reply_text(msg)
 
+# ---------- MAIN STREAM ----------
+async def stream_subreddits():
+    while True:
+        try:
+            for submission in reddit.subreddit("+".join(subreddit_map.keys())).stream.submissions(skip_existing=True):
+                topic_id = subreddit_map.get(submission.subreddit.display_name, telegram_error_topic_id)
+                media_list = await get_media_urls(submission)
+                await send_media(submission, media_list, topic_id)
+        except Exception as e:
+            logging.error(f"Stream error: {e}. Restarting in 10s...")
+            await asyncio.sleep(10)
+
 # ---------- MAIN LOOP ----------
 async def main():
     app = Application.builder().token(telegram_token).build()
@@ -209,20 +208,10 @@ async def main():
 
     logging.info("Bot started, monitoring subreddits: %s", ", ".join(subreddit_map.keys()))
 
-    # Start subreddit streaming in background
-    async def stream_subreddits():
-        while True:
-            try:
-                for submission in reddit.subreddit("+".join(subreddit_map.keys())).stream.submissions(skip_existing=True):
-                    topic_id = subreddit_map.get(submission.subreddit.display_name, telegram_error_topic_id)
-                    media_list = await get_media_urls(submission)
-                    await send_media(submission, media_list, topic_id)
-            except Exception as e:
-                logging.error(f"Stream error: {e}. Restarting in 10s...")
-                await asyncio.sleep(10)
+    # Start subreddit streaming as a background task
+    asyncio.create_task(stream_subreddits())
 
-    app.job_queue.run_once(lambda ctx: asyncio.create_task(stream_subreddits()), when=0)
-
+    # Run the bot
     await app.run_polling()
 
 if __name__ == "__main__":
