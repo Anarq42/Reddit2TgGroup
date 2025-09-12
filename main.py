@@ -41,6 +41,9 @@ reddit = Reddit(
 # ---------- LOAD SUBREDDITS ----------
 def load_subreddits_mapping(file_path):
     mapping = {}
+    if not os.path.exists(file_path):
+        logging.warning(f"Subreddits DB file not found: {file_path}")
+        return mapping
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -54,6 +57,8 @@ def load_subreddits_mapping(file_path):
     return mapping
 
 subreddit_map = load_subreddits_mapping(subreddits_db_path)
+if not subreddit_map:
+    logging.warning("No subreddits loaded! Bot will only respond to /post commands.")
 
 # ---------- UTILS ----------
 def prepare_caption(submission: Submission):
@@ -69,26 +74,19 @@ async def fetch_bytes(session, url):
 async def get_media_urls(submission: Submission):
     media_list = []
 
-    # Reddit gallery
     if getattr(submission, 'is_gallery', False):
         for key, meta in submission.media_metadata.items():
             if meta['e'] == 'Image':
                 url = meta['s']['u'].replace("&amp;", "&")
                 media_list.append({"url": url, "type": "photo"})
-
-    # Reddit video
     elif hasattr(submission, 'media') and submission.media and 'reddit_video' in submission.media:
         media_url = submission.media['reddit_video']['fallback_url']
         media_list.append({"url": media_url, "type": "video"})
-
-    # Direct image/video links
     elif submission.url.endswith((".jpg", ".jpeg", ".png")):
         media_list.append({"url": submission.url, "type": "photo"})
     elif submission.url.endswith((".gif", ".mp4")):
         media_type = "gif" if submission.url.endswith(".gif") else "video"
         media_list.append({"url": submission.url, "type": media_type})
-
-    # External hosts
     else:
         host_url = submission.url.lower()
         if "imgur.com" in host_url and host_url.endswith((".jpg", ".png", ".gif")):
@@ -100,7 +98,6 @@ async def get_media_urls(submission: Submission):
 
     return media_list
 
-# ---------- Gfycat/Redgifs MP4 DOWNLOAD ----------
 async def get_gfy_redgifs_mp4(url):
     try:
         async with aiohttp.ClientSession() as session:
@@ -129,10 +126,10 @@ async def get_gfy_redgifs_mp4(url):
 async def send_media(submission: Submission, media_list, topic_id):
     caption = prepare_caption(submission)
     try:
-        if media_list:
-            if len(media_list) > 1:
-                tg_media = []
-                async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession() as session:
+            if media_list:
+                if len(media_list) > 1:
+                    tg_media = []
                     for i, media in enumerate(media_list):
                         bio = await fetch_bytes(session, media["url"])
                         kwargs = {"caption": caption if i == 0 else None, "parse_mode": ParseMode.HTML}
@@ -140,23 +137,22 @@ async def send_media(submission: Submission, media_list, topic_id):
                             tg_media.append(InputMediaPhoto(media=bio, **kwargs))
                         elif media["type"] in ["video", "gif"]:
                             tg_media.append(InputMediaVideo(media=bio, **kwargs))
-                await bot.send_media_group(chat_id=telegram_group_id, message_thread_id=topic_id, media=tg_media)
-            else:
-                media = media_list[0]
-                async with aiohttp.ClientSession() as session:
+                    await bot.send_media_group(chat_id=telegram_group_id, message_thread_id=topic_id, media=tg_media)
+                else:
+                    media = media_list[0]
                     bio = await fetch_bytes(session, media["url"])
-                if media["type"] == "photo":
-                    await bot.send_photo(chat_id=telegram_group_id, message_thread_id=topic_id,
-                                         photo=bio, caption=caption, parse_mode=ParseMode.HTML)
-                elif media["type"] == "video":
-                    await bot.send_video(chat_id=telegram_group_id, message_thread_id=topic_id,
-                                         video=bio, caption=caption, parse_mode=ParseMode.HTML)
-                elif media["type"] == "gif":
-                    await bot.send_animation(chat_id=telegram_group_id, message_thread_id=topic_id,
-                                             animation=bio, caption=caption, parse_mode=ParseMode.HTML)
-        else:
-            await bot.send_message(chat_id=telegram_group_id, message_thread_id=topic_id,
-                                   text=caption, parse_mode=ParseMode.HTML)
+                    if media["type"] == "photo":
+                        await bot.send_photo(chat_id=telegram_group_id, message_thread_id=topic_id,
+                                             photo=bio, caption=caption, parse_mode=ParseMode.HTML)
+                    elif media["type"] == "video":
+                        await bot.send_video(chat_id=telegram_group_id, message_thread_id=topic_id,
+                                             video=bio, caption=caption, parse_mode=ParseMode.HTML)
+                    elif media["type"] == "gif":
+                        await bot.send_animation(chat_id=telegram_group_id, message_thread_id=topic_id,
+                                                 animation=bio, caption=caption, parse_mode=ParseMode.HTML)
+            else:
+                await bot.send_message(chat_id=telegram_group_id, message_thread_id=topic_id,
+                                       text=caption, parse_mode=ParseMode.HTML)
 
         logging.info(f"Post sent: {submission.title} to topic {topic_id}")
     except TelegramError as e:
@@ -186,39 +182,39 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await send_reddit_link(url)
     await update.message.reply_text(msg)
 
-# ---------- MAIN STREAM ----------
-async def stream_subreddits():
+# ---------- STREAM REDDIT SUBREDDITS ----------
+async def stream_subreddits_task():
+    if not subreddit_map:
+        return
+    loop = asyncio.get_event_loop()
+    def submissions_generator():
+        return reddit.subreddit("+".join(subreddit_map.keys())).stream.submissions(skip_existing=True)
     while True:
         try:
-            for submission in reddit.subreddit("+".join(subreddit_map.keys())).stream.submissions(skip_existing=True):
-                topic_id = subreddit_map.get(submission.subreddit.display_name, telegram_error_topic_id)
-                media_list = await get_media_urls(submission)
-                await send_media(submission, media_list, topic_id)
+            for submission in submissions_generator():
+                loop.create_task(process_submission(submission))
         except Exception as e:
             logging.error(f"Stream error: {e}. Restarting in 10s...")
             await asyncio.sleep(10)
+
+async def process_submission(submission):
+    topic_id = subreddit_map.get(submission.subreddit.display_name, telegram_error_topic_id)
+    media_list = await get_media_urls(submission)
+    await send_media(submission, media_list, topic_id)
 
 # ---------- MAIN LOOP ----------
 async def main():
     app = Application.builder().token(telegram_token).build()
     app.add_handler(CommandHandler("post", post_command))
+
     logging.info("Bot started, monitoring subreddits: %s", ", ".join(subreddit_map.keys()))
-    asyncio.create_task(stream_subreddits())
-    await app.initialize()
-    await app.updater.start_polling()
-    await app.updater.idle()
+
+    # Start Reddit stream in background
+    asyncio.create_task(stream_subreddits_task())
+
+    # Run the Telegram bot
+    await app.run_polling()
 
 # ---------- START ----------
 if __name__ == "__main__":
-    async def runner():
-        await main()
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        asyncio.create_task(runner())
-    else:
-        asyncio.run(runner())
+    asyncio.run(main())
