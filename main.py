@@ -120,11 +120,9 @@ async def get_gfy_redgifs_mp4(url: str, session: aiohttp.ClientSession) -> Optio
         async with session.get(url) as resp:
             text = await resp.text()
             soup = BeautifulSoup(text, "html.parser")
-            # First try the standard video source tag
             mp4_tag = soup.find("source", {"type": "video/mp4", "src": True})
             if mp4_tag:
                 return mp4_tag["src"]
-            # Fallback for Redgifs' newer script-based data embedding
             script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
             if script_tag:
                 data = json.loads(script_tag.string)
@@ -137,7 +135,6 @@ async def get_gfy_redgifs_mp4(url: str, session: aiohttp.ClientSession) -> Optio
 async def get_media_urls(submission, session):
     media_list = []
     try:
-        # Reddit gallery
         if getattr(submission, "is_gallery", False) and hasattr(submission, "media_metadata"):
             for item in submission.gallery_data['items']:
                 media_id = item['media_id']
@@ -145,13 +142,10 @@ async def get_media_urls(submission, session):
                 if meta['e'] == 'Image':
                     url = meta['s']['u'].replace("&amp;", "&")
                     media_list.append({"url": url, "type": "photo"})
-
-        # Reddit video
         elif getattr(submission, "is_video", False) and hasattr(submission, "media") and submission.media and "reddit_video" in submission.media:
             media_url = submission.media["reddit_video"]["fallback_url"]
             media_list.append({"url": media_url, "type": "video"})
-
-        else: # Direct links and external sites
+        else:
             url_lower = getattr(submission, "url", "").lower()
             if any(url_lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
                 media_list.append({"url": submission.url, "type": "photo"})
@@ -162,7 +156,6 @@ async def get_media_urls(submission, session):
                 mp4_url = await get_gfy_redgifs_mp4(submission.url, session)
                 if mp4_url:
                     media_list.append({"url": mp4_url, "type": "video"})
-
     except Exception as e:
         logging.warning(f"Failed to get media URLs for post {getattr(submission, 'id', '?')}: {e}")
     return media_list
@@ -177,70 +170,63 @@ async def _safe_send(primary_fn: Callable[[], Awaitable], fallback_fn: Optional[
             msg = str(e).lower()
             if "topic_closed" in msg or "topic is closed" in msg:
                 logging.warning("Topic closed, attempting to send to main group.")
-                if fallback_fn:
-                    return await fallback_fn()
-                raise  # Re-raise if no fallback
+                if fallback_fn: return await fallback_fn()
+                raise
             elif "chat not found" in msg:
                 logging.error("Chat not found. Cannot send message.")
-                raise # Propagate this critical error
+                raise
+            elif "photo_invalid_dimensions" in msg:
+                 logging.warning(f"Photo has invalid dimensions. Will not send media.")
+                 raise # Raise to be caught by the calling function for fallback
             else:
                 logging.error(f"BadRequest on send: {e}")
-                raise # Re-raise other BadRequests
+                raise
         except TimedOut:
+            last_exc = TimedOut
             logging.warning(f"TimedOut sending message, attempt {attempt + 1}/{retries}. Retrying...")
             await asyncio.sleep(2 ** attempt)
             continue
-        except Exception:
+        except Exception as e:
+            last_exc = e
             logging.exception("Unexpected error in _safe_send")
             raise
     raise last_exc or Exception("Failed to send message after multiple retries.")
 
-# ---------- SEND MEDIA (OPTIMIZED) ----------
+# ---------- SEND MEDIA (CORRECTED) ----------
 async def send_media(submission, media_list, topic_id, bot):
     caption = prepare_caption(submission)
-    send_params = {
-        "chat_id": TELEGRAM_GROUP_ID,
-        "message_thread_id": topic_id,
-        "caption": caption,
-        "parse_mode": ParseMode.HTML
-    }
+    
+    # Parameters for media messages
+    send_params = { "chat_id": TELEGRAM_GROUP_ID, "message_thread_id": topic_id, "caption": caption, "parse_mode": ParseMode.HTML }
     fallback_params = {k: v for k, v in send_params.items() if k != "message_thread_id"}
+    
+    # Parameters for text-only messages (uses 'text' instead of 'caption')
+    text_send_params = { "chat_id": TELEGRAM_GROUP_ID, "message_thread_id": topic_id, "text": caption, "parse_mode": ParseMode.HTML }
+    text_fallback_params = {k: v for k, v in text_send_params.items() if k != "message_thread_id"}
 
     try:
         if not media_list:
             await _safe_send(
-                primary_fn=lambda: bot.send_message(text=caption, **send_params),
-                fallback_fn=lambda: bot.send_message(text=caption, **fallback_params)
+                primary_fn=lambda: bot.send_message(**text_send_params),
+                fallback_fn=lambda: bot.send_message(**text_fallback_params)
             )
         elif len(media_list) > 1:
             async with aiohttp.ClientSession() as session:
                 media_bytes_tasks = [fetch_bytes(session, m["url"]) for m in media_list[:10]]
                 media_bytes_results = await asyncio.gather(*media_bytes_tasks)
-                
-                tg_media = []
-                for i, bio in enumerate(media_bytes_results):
-                    if bio:
-                        media_type = media_list[i]["type"]
-                        InputMediaClass = InputMediaPhoto if media_type == "photo" else InputMediaVideo
-                        tg_media.append(InputMediaClass(media=bio, caption=caption if i == 0 else None, parse_mode=ParseMode.HTML))
-
+                tg_media = [InputMediaPhoto(media=bio, caption=caption if i == 0 else None, parse_mode=ParseMode.HTML) for i, bio in enumerate(media_bytes_results) if bio]
                 if tg_media:
                     await _safe_send(
                         primary_fn=lambda: bot.send_media_group(chat_id=TELEGRAM_GROUP_ID, message_thread_id=topic_id, media=tg_media),
                         fallback_fn=lambda: bot.send_media_group(chat_id=TELEGRAM_GROUP_ID, media=tg_media)
                     )
-        else: # Single media
+        else:
             media = media_list[0]
-            async with aiohttp.ClientSession() as session:
-                bio = await fetch_bytes(session, media["url"])
-
-            if bio is None: # Fallback to text if download fails
-                await send_media(submission, [], topic_id, bot)
-                return True
+            async with aiohttp.ClientSession() as session: bio = await fetch_bytes(session, media["url"])
+            if not bio: raise ValueError("Media download failed")
 
             send_map = {"photo": bot.send_photo, "video": bot.send_video, "gif": bot.send_animation}
             send_func = send_map.get(media["type"])
-
             if send_func:
                 media_kwarg = "animation" if media["type"] == "gif" else media["type"]
                 await _safe_send(
@@ -250,79 +236,69 @@ async def send_media(submission, media_list, topic_id, bot):
 
         logging.info("Post sent: %s to topic %s", submission.title, topic_id)
         return True
-    except Exception as e:
-        logging.error("Failed to send post %s: %s", submission.id, e)
-        # Attempt to notify admin in error topic
+    except (Exception, BadRequest) as e:
+        # If any media sending fails (including invalid dimensions), fall back to a text-only post
+        logging.error("Failed to send post %s as media due to: %s. Sending as text.", submission.id, e)
         try:
-            error_text = f"Failed to send post:\n<b>Title:</b> {html.escape(submission.title)}\n<b>Error:</b> {html.escape(str(e))}"
-            await bot.send_message(chat_id=TELEGRAM_GROUP_ID, message_thread_id=TELEGRAM_ERROR_TOPIC_ID, text=error_text, parse_mode=ParseMode.HTML)
+            await _safe_send(
+                primary_fn=lambda: bot.send_message(**text_send_params),
+                fallback_fn=lambda: bot.send_message(**text_fallback_params)
+            )
+            return True # Successfully sent as text
         except Exception:
             logging.exception("Could not send failure notice to error topic.")
         return False
 
 # ---------- PROCESS REDDIT LINK ----------
 async def process_submission(submission, context: ContextTypes.DEFAULT_TYPE):
-    bot = context.bot
     app_data = context.application.bot_data
-    
     async with app_data["posted_ids_lock"]:
-        if submission.id in app_data["posted_ids"]:
-            return # Skip duplicate
+        if submission.id in app_data["posted_ids"]: return
 
     topic_id = app_data["subreddit_map"].get(submission.subreddit.display_name.lower(), TELEGRAM_ERROR_TOPIC_ID)
-    
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         media_list = await get_media_urls(submission, session)
 
-    if await send_media(submission, media_list, topic_id, bot):
+    if await send_media(submission, media_list, topic_id, context.bot):
         async with app_data["posted_ids_lock"]:
             app_data["posted_ids"].add(submission.id)
             save_posted_ids(app_data["posted_ids"])
 
 # ---------- TELEGRAM COMMANDS ----------
 async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
     if not context.args:
-        await update.effective_message.reply_text("Usage: /post <reddit_url>")
+        try: await msg.reply_text("Usage: /post <reddit_url>")
+        except Exception: logging.warning("Failed to send usage message for /post")
         return
     
     url = context.args[0]
-    reddit_client = context.application.bot_data.get("reddit_client")
-    if not reddit_client:
-        await update.effective_message.reply_text("Reddit client not ready. Please wait a moment.")
+    if not (reddit_client := context.application.bot_data.get("reddit_client")):
+        try: await msg.reply_text("Reddit client not ready. Please wait a moment.")
+        except Exception: logging.warning("Failed to send client not ready message")
         return
         
     try:
         submission = await reddit_client.submission(url=url)
         await process_submission(submission, context)
-        await update.effective_message.reply_text(f"Processed post: {submission.title}")
+        try: await msg.reply_text(f"Processed post: {submission.title}")
+        except Exception: logging.warning(f"Failed to send success reply for /post {url}")
     except Exception as e:
         logging.error(f"Failed to process /post command for URL {url}: {e}")
-        await update.effective_message.reply_text(f"Error processing URL: {e}")
+        try: await msg.reply_text(f"Error processing URL: {e}")
+        except Exception: logging.warning(f"Failed to send error reply for /post {url}")
 
 async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != TELEGRAM_ADMIN_ID:
-        await update.effective_message.reply_text("You are not authorized to use this command.")
-        return
-
     logging.info("Admin triggered /reload command.")
     await update.effective_message.reply_text("Reloading subreddits and restarting stream...")
-    
-    # Reload subreddit mapping
     context.application.bot_data["subreddit_map"] = load_subreddits_mapping(SUBREDDITS_DB_PATH)
-    
-    # Restart the background stream task
     await stop_and_restart_stream(context.application)
-    
     new_subreddits = ", ".join(context.application.bot_data["subreddit_map"].keys())
     await update.effective_message.reply_text(f"Reload complete. Now monitoring: {new_subreddits}")
 
-
 # ---------- STREAM SUBREDDITS ----------
 async def stream_subreddits_task(app: Application):
-    reddit = app.bot_data["reddit_client"]
     subreddit_map = app.bot_data["subreddit_map"]
-
     if not subreddit_map:
         logging.warning("No subreddits configured. Stream will not start.")
         return
@@ -331,61 +307,45 @@ async def stream_subreddits_task(app: Application):
     logging.info(f"Starting stream for subreddits: {subreddit_names}")
     
     try:
-        subreddit = await reddit.subreddit(subreddit_names)
+        subreddit = await app.bot_data["reddit_client"].subreddit(subreddit_names)
         async for submission in subreddit.stream.submissions(skip_existing=True):
-            # Use run_coroutine_on_thread to process each submission
-            # This ensures that one slow post doesn't block new ones from the stream
             context = ContextTypes.DEFAULT_TYPE(application=app)
             asyncio.create_task(process_submission(submission, context))
     except asyncio.CancelledError:
         logging.info("Subreddit stream task was cancelled.")
-    except Exception:
-        logging.exception("Subreddit stream encountered a critical error. It will not restart automatically.")
+    except Exception as e:
+        logging.exception(f"Subreddit stream failed with error: {e}. It will not restart automatically.")
 
 async def stop_and_restart_stream(app: Application):
-    # Cancel the old task if it exists
-    current_task = app.bot_data.get("stream_task")
-    if current_task and not current_task.done():
+    if (current_task := app.bot_data.get("stream_task")) and not current_task.done():
         current_task.cancel()
-        try:
-            await current_task
-        except asyncio.CancelledError:
-            pass # Expected
-    
-    # Start the new task
+        try: await current_task
+        except asyncio.CancelledError: pass
     app.bot_data["stream_task"] = asyncio.create_task(stream_subreddits_task(app))
 
 # ---------- STARTUP / SHUTDOWN HOOKS ----------
 async def on_startup(app: Application):
     logging.info("Bot starting up...")
     app.bot_data["reddit_client"] = asyncpraw.Reddit(
-        client_id=REDDIT_CLIENT_ID,
-        client_secret=REDDIT_CLIENT_SECRET,
-        username=REDDIT_USERNAME,
-        password=REDDIT_PASSWORD,
-        user_agent="TelegramRedditBot/2.0 by anarq42",
+        client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET,
+        username=REDDIT_USERNAME, password=REDDIT_PASSWORD,
+        user_agent="TelegramRedditBot/2.1 by anarq42",
     )
-    app.bot_data["posted_ids"] = load_posted_ids()
-    app.bot_data["posted_ids_lock"] = asyncio.Lock()
-    app.bot_data["subreddit_map"] = load_subreddits_mapping(SUBREDDITS_DB_PATH)
-    
-    await stop_and_restart_stream(app) # Initial start
+    app.bot_data.update({
+        "posted_ids": load_posted_ids(),
+        "posted_ids_lock": asyncio.Lock(),
+        "subreddit_map": load_subreddits_mapping(SUBREDDITS_DB_PATH)
+    })
+    await stop_and_restart_stream(app)
     logging.info("Startup complete.")
 
 async def on_shutdown(app: Application):
     logging.info("Bot shutting down...")
-    # Cleanly cancel the stream task
-    stream_task = app.bot_data.get("stream_task")
-    if stream_task and not stream_task.done():
+    if (stream_task := app.bot_data.get("stream_task")) and not stream_task.done():
         stream_task.cancel()
-        try:
-            await stream_task
-        except asyncio.CancelledError:
-            logging.info("Subreddit stream task successfully cancelled.")
-    
-    # Close Reddit client
-    reddit_client = app.bot_data.get("reddit_client")
-    if reddit_client:
+        try: await stream_task
+        except asyncio.CancelledError: logging.info("Subreddit stream task successfully cancelled.")
+    if reddit_client := app.bot_data.get("reddit_client"):
         await reddit_client.close()
     logging.info("Shutdown complete.")
 
@@ -396,17 +356,12 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 # ---------- MAIN ----------
 def main():
     app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(on_startup)
-        .post_shutdown(on_shutdown)
-        .build()
+        Application.builder().token(TELEGRAM_TOKEN)
+        .post_init(on_startup).post_shutdown(on_shutdown).build()
     )
-
     app.add_handler(CommandHandler("post", post_command))
     app.add_handler(CommandHandler("reload", reload_command, filters=filters.User(user_id=TELEGRAM_ADMIN_ID)))
     app.add_error_handler(global_error_handler)
-
     logging.info("Bot application configured. Starting polling...")
     app.run_polling()
 
