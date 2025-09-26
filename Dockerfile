@@ -1,17 +1,22 @@
-# Use an official Python 3.10 slim image
+# Use an official Python runtime as a parent image
 FROM python:3.10-slim
 
-# Set the working directory inside the container
+# Set the working directory in the container
 WORKDIR /app
 
-# Copy the file that lists your dependencies
+# Install FFmpeg and other system dependencies
+# apt-get update refreshes the package lists
+# -y flag auto-confirms the installation
+RUN apt-get update && apt-get install -y ffmpeg libsm6 libxext6
+
+# Copy the requirements file into the container
 COPY requirements.txt .
 
-# Install the dependencies
+# Install any needed packages specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy all your other files (like main.py) into the container
+# Copy the rest of your application's code
 COPY . .
 
-# Set the command to run when the container starts
+# Command to run on container start
 CMD ["python", "main.py"]
