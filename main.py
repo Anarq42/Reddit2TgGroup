@@ -8,6 +8,7 @@ import re
 import html
 from io import BytesIO
 from typing import Optional, Callable, Awaitable
+import uuid
 
 from telegram import Update, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ParseMode
@@ -16,6 +17,7 @@ from telegram.error import TelegramError, BadRequest, TimedOut
 
 import asyncpraw
 from bs4 import BeautifulSoup
+from moviepy.editor import VideoFileClip, AudioFileClip
 
 # ---------- LOGGING ----------
 logging.basicConfig(
@@ -115,7 +117,24 @@ async def get_media_urls(submission, session):
                     url = submission.media_metadata[media_id]['s']['u'].replace("&amp;", "&")
                     media_list.append({"url": url, "type": "photo"})
         elif getattr(submission, "is_video", False) and hasattr(submission, "media") and submission.media.get("reddit_video"):
-            media_list.append({"url": submission.media["reddit_video"]["fallback_url"], "type": "video"})
+            dash_url = submission.media["reddit_video"]["dash_url"]
+            async with session.get(dash_url) as resp:
+                manifest_text = await resp.text()
+            
+            soup = BeautifulSoup(manifest_text, "lxml")
+            base_url = dash_url.rsplit('/', 1)[0] + '/'
+            video_url = None
+            audio_url = None
+            
+            for adaptation_set in soup.find_all("adaptationset"):
+                mime_type = adaptation_set.get("mimetype")
+                if "video" in mime_type:
+                    video_url = base_url + adaptation_set.find("baseurl").text
+                elif "audio" in mime_type:
+                    audio_url = base_url + adaptation_set.find("baseurl").text
+            
+            if video_url:
+                 media_list.append({"url": video_url, "audio_url": audio_url, "type": "video"})
         elif any(url_lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
             media_list.append({"url": submission.url, "type": "photo"})
         elif any(url_lower.endswith(ext) for ext in [".gif", ".mp4"]):
@@ -176,17 +195,64 @@ async def send_media(submission, topic_id, bot):
                 )
         else:
             media = media_list[0]
-            bio = await fetch_bytes(session, media["url"])
-            if not bio: raise ValueError("Media download failed or returned empty.")
-            
-            send_map = {"photo": bot.send_photo, "video": bot.send_video, "gif": bot.send_animation}
-            send_func = send_map.get(media["type"])
-            if send_func:
-                media_kwarg = "animation" if media["type"] == "gif" else media["type"]
-                await _safe_send(
-                    lambda: send_func(**{media_kwarg: bio}, **send_params),
-                    lambda: send_func(**{media_kwarg: bio}, **fallback_params)
-                )
+            if media["type"] == "video" and media.get("audio_url"):
+                video_bio = await fetch_bytes(session, media["url"])
+                audio_bio = await fetch_bytes(session, media["audio_url"])
+
+                if video_bio and audio_bio:
+                    tmp_id = uuid.uuid4()
+                    video_path = f"/tmp/{tmp_id}_video.mp4"
+                    audio_path = f"/tmp/{tmp_id}_audio.mp4"
+                    output_path = f"/tmp/{tmp_id}_final.mp4"
+
+                    with open(video_path, "wb") as f: f.write(video_bio.getvalue())
+                    with open(audio_path, "wb") as f: f.write(audio_bio.getvalue())
+
+                    try:
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(
+                            None,
+                            lambda: VideoFileClip(video_path).set_audio(AudioFileClip(audio_path)).write_videofile(
+                                output_path,
+                                codec='libx264',
+                                audio_codec='aac',
+                                temp_audiofile=f'/tmp/{tmp_id}_temp_audio.m4a',
+                                remove_temp=True,
+                                logger=None
+                            )
+                        )
+                        
+                        with open(output_path, "rb") as f:
+                             await _safe_send(
+                                lambda: bot.send_video(video=f, **send_params),
+                                lambda: bot.send_video(video=f, **fallback_params)
+                            )
+                    finally:
+                        if os.path.exists(video_path): os.remove(video_path)
+                        if os.path.exists(audio_path): os.remove(audio_path)
+                        if os.path.exists(output_path): os.remove(output_path)
+                        
+                elif video_bio:
+                    bio = video_bio
+                    await _safe_send(
+                        lambda: bot.send_video(video=bio, **send_params),
+                        lambda: bot.send_video(video=bio, **fallback_params)
+                    )
+                else:
+                    raise ValueError("Video download failed.")
+
+            else:
+                bio = await fetch_bytes(session, media["url"])
+                if not bio: raise ValueError("Media download failed or returned empty.")
+                
+                send_map = {"photo": bot.send_photo, "video": bot.send_video, "gif": bot.send_animation}
+                send_func = send_map.get(media["type"])
+                if send_func:
+                    media_kwarg = "animation" if media["type"] == "gif" else media["type"]
+                    await _safe_send(
+                        lambda: send_func(**{media_kwarg: bio}, **send_params),
+                        lambda: send_func(**{media_kwarg: bio}, **fallback_params)
+                    )
 
     logging.info("Post sent: %s to topic %s", submission.title, topic_id)
     return True
@@ -215,7 +281,6 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await msg.reply_text("Reddit client not ready.")
     try:
         submission = await reddit.submission(url=context.args[0])
-        # Manually trigger processing
         await process_submission(submission, context)
         await msg.reply_text(f"Attempted to process post: {submission.title}")
     except Exception as e:
@@ -246,7 +311,6 @@ async def stream_subreddits_task(app: Application):
         logging.info("Subreddit stream task was cancelled.")
     except Exception as e:
         logging.exception(f"Subreddit stream failed: {e}")
-        # Notify admin of critical stream failure
         error_text = f"🚨 **CRITICAL: Reddit Stream Failure** 🚨\n\nThe bot's Reddit stream has crashed and will not automatically restart.\n\n**Error:**\n`{html.escape(str(e))}`"
         await app.bot.send_message(chat_id=TELEGRAM_GROUP_ID, message_thread_id=TELEGRAM_ERROR_TOPIC_ID, text=error_text, parse_mode=ParseMode.HTML)
 
